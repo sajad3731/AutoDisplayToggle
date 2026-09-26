@@ -198,21 +198,49 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // وقتی برنامه از داخل بانْدل اجرا شود، نوتیفیکیشن‌ها از مسیر UserNotifications
     // فرستاده می‌شوند و آیکن خود برنامه را نشان می‌دهند. مسیر قدیمی osascript
     // نوتیفیکیشن را به نام و آیکن Script Editor نمایش می‌داد.
+    // اجرای باینری خام (خارج از .app) بانْدل ندارد و در آن حالت
+    // UNUserNotificationCenter.current() برنامه را کرش می‌کند.
+    var isBundled: Bool {
+        Bundle.main.bundleIdentifier != nil && Bundle.main.bundleURL.pathExtension == "app"
+    }
+
     func setupNotifications(then completion: @escaping () -> Void) {
-        // اجرای باینری خام (خارج از .app) بانْدل ندارد و در آن حالت
-        // UNUserNotificationCenter.current() برنامه را کرش می‌کند.
-        guard Bundle.main.bundleIdentifier != nil,
-              Bundle.main.bundleURL.pathExtension == "app" else {
+        guard isBundled else {
             completion()
+            return
+        }
+        UNUserNotificationCenter.current().delegate = self
+        refreshNotificationAuthorization(then: completion)
+    }
+
+    // وضعیت مجوز را از سیستم می‌پرسد. اگر کاربر بعداً از تنظیمات سیستم
+    // نوتیفیکیشن را روشن کند، بدون ری‌استارت برنامه هم اثر می‌کند.
+    func refreshNotificationAuthorization(then completion: (() -> Void)? = nil) {
+        guard isBundled else {
+            completion?()
             return
         }
 
         let center = UNUserNotificationCenter.current()
-        center.delegate = self
-        center.requestAuthorization(options: [.alert]) { [weak self] granted, _ in
-            DispatchQueue.main.async {
-                self?.useUserNotifications = granted
-                completion()
+        center.getNotificationSettings { [weak self] settings in
+            switch settings.authorizationStatus {
+            case .notDetermined:
+                center.requestAuthorization(options: [.alert]) { granted, _ in
+                    DispatchQueue.main.async {
+                        self?.useUserNotifications = granted
+                        completion?()
+                    }
+                }
+            case .authorized, .provisional:
+                DispatchQueue.main.async {
+                    self?.useUserNotifications = true
+                    completion?()
+                }
+            default:
+                DispatchQueue.main.async {
+                    self?.useUserNotifications = false
+                    completion?()
+                }
             }
         }
     }
@@ -220,6 +248,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func sendNotification(title: String, message: String) {
         guard useUserNotifications else {
             sendNotificationViaAppleScript(title: title, message: message)
+            // شاید مجوز بعد از اجرا داده شده باشد؛ برای دفعه‌ی بعد دوباره می‌پرسیم
+            refreshNotificationAuthorization()
             return
         }
 

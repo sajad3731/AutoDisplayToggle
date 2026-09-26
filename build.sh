@@ -7,6 +7,7 @@ APP_NAME="AutoDisplayToggle"
 BUILD_DIR="build"
 APP_BUNDLE="/Applications/${APP_NAME}.app"
 ICON_PNG="Icon/icon.png"
+SIGN_IDENTITY_NAME="${CODESIGN_IDENTITY:-AutoDisplayToggle Dev}"
 ICON_ICNS="Icon/AppIcon.icns"
 BUILT_ICNS="${BUILD_DIR}/AppIcon.icns"
 
@@ -83,11 +84,24 @@ if [[ "$HAVE_ICON" == "1" ]]; then
     xattr -d com.apple.FinderInfo "${APP_BUNDLE}" >/dev/null 2>&1 || true
 fi
 
-# Ad-hoc signature. Notifications are delivered under the bundle identity, and
-# an unsigned bundle is where that tends to be refused.
-codesign --force --sign - --identifier com.user.AutoDisplayToggle \
-    "${APP_BUNDLE}" >/dev/null 2>&1 \
-    || echo "Warning: ad-hoc signing failed; notifications may fall back to osascript."
+# macOS ties Accessibility and Notification grants to the code signing
+# identity. An ad-hoc signature (--sign -) is just a hash of the binary, so
+# every rebuild looks like a different app and both grants are dropped - which
+# is why the Accessibility prompt keeps coming back. A self-signed certificate
+# stays the same across rebuilds, so the grants stick. See README.
+if security find-identity -v -p codesigning 2>/dev/null \
+        | grep -qF "${SIGN_IDENTITY_NAME}"; then
+    echo "Signing with '${SIGN_IDENTITY_NAME}'..."
+    codesign --force --sign "${SIGN_IDENTITY_NAME}" \
+        --identifier com.user.AutoDisplayToggle "${APP_BUNDLE}" \
+        || echo "Warning: signing failed."
+else
+    codesign --force --sign - --identifier com.user.AutoDisplayToggle \
+        "${APP_BUNDLE}" >/dev/null 2>&1 \
+        || echo "Warning: ad-hoc signing failed; notifications may fall back to osascript."
+    echo "Signed ad-hoc. Accessibility and notification permission will have to be"
+    echo "re-granted after every rebuild - see 'Making permissions stick' in README.md."
+fi
 
 # Nudge Finder/Dock to drop the cached icon for this bundle.
 touch "${APP_BUNDLE}"

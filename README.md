@@ -84,6 +84,40 @@ comes back.
 The menu bar icon is separate — it stays an SF Symbol (`display.2`), which
 adapts to light/dark menu bars the way a full-color icon can't.
 
+## Making permissions stick
+
+macOS ties Accessibility and notification permission to the app's **code
+signing identity**, not to its path. An unsigned or ad-hoc-signed app is
+identified by a hash of its own bytes, so every rebuild is a different app as
+far as the system is concerned: the Accessibility grant stops applying and the
+prompt returns, and notifications fall back to `osascript` (which is why they
+show up as **Script Editor**).
+
+A self-signed certificate keeps the identity stable across rebuilds. Create one
+once:
+
+1. Open **Keychain Access → Certificate Assistant → Create a Certificate…**
+2. Name: `AutoDisplayToggle Dev`, Identity Type: *Self Signed Root*,
+   Certificate Type: **Code Signing**. Create it.
+
+`build.sh --install` picks it up automatically by name; set `CODESIGN_IDENTITY`
+to use a different one. Without it, the build falls back to an ad-hoc signature
+and says so.
+
+After switching identities, clear the stale permission entries once:
+
+```bash
+tccutil reset Accessibility com.user.AutoDisplayToggle
+```
+
+Then relaunch and grant again — this time it survives rebuilds.
+
+If notifications still arrive as **Script Editor**, check
+**System Settings → Notifications → AutoDisplayToggle** and allow them; the app
+re-checks the setting as it runs, so there is no need to restart it. If the app
+isn't listed there at all, it is not registered under its own identity — which
+means the installed bundle is not the one this build produced.
+
 ## Usage
 
 The app lives in the menu bar and needs no configuration — connect an external
@@ -170,10 +204,10 @@ means **a future macOS release can break this app without warning.**
 
 ## Caveats
 
-- The app is **ad-hoc signed** (`codesign --sign -`), not signed with a
-  Developer ID. Because macOS ties permissions to the binary's identity, you may
-  need to re-grant Accessibility — and re-allow notifications — after a rebuild
-  for the keyboard shortcuts and notifications to keep working.
+- The app is **not signed with a Developer ID**. Without the self-signed
+  certificate described under *Making permissions stick*, it is signed ad-hoc
+  and both Accessibility and notification permission have to be granted again
+  after every rebuild.
 - If the app starts while the internal display is already off at zero
   brightness, it cannot know your previous brightness level and restores to 50%.
 - In clamshell mode the built-in display isn't enumerated at all, so the app
