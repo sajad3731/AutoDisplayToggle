@@ -8,16 +8,22 @@
 	<string>com.user.AutoDisplayToggle</string>
 	<key>CFBundleName</key>
 	<string>AutoDisplayToggle</string>
+	<key>CFBundleDisplayName</key>
+	<string>AutoDisplayToggle</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.1</string>
+	<string>1.2</string>
 	<key>CFBundleVersion</key>
-	<string>1.1</string>
+	<string>1.2</string>
 	<key>LSMinimumSystemVersion</key>
-	<string>10.12</string>
+	<string>11.0</string>
 	<key>LSUIElement</key>
-	<false/>
+	<true/>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 </dict>

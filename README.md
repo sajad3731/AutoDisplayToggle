@@ -32,7 +32,7 @@ a one-time action.
 
 ## Requirements
 
-- macOS (developed and tested on macOS 26.7, Intel MacBook Pro)
+- macOS 11 or later (developed and tested on macOS 26.7, Intel MacBook Pro)
 - Xcode Command Line Tools, for `swiftc`:
   ```bash
   xcode-select --install
@@ -56,10 +56,40 @@ just builds into `build/`.
 To start it automatically, add the app under
 **System Settings → General → Login Items**.
 
+## App icon
+
+The icon is built from `Icon/icon.png` — replace that file with your own to
+change it, then re-run `./build.sh --install`:
+
+- Use a **square** PNG, ideally 1024×1024. `build.sh` renders every size macOS
+  asks for (`sips` + `iconutil`) into `Contents/Resources/AppIcon.icns`, so the
+  icon stays sharp in Finder, in notifications and in the Privacy & Security
+  permission lists. A non-square source gets stretched.
+- If you already have a finished `.icns`, commit it as `Icon/AppIcon.icns` and
+  it is used as-is, no conversion.
+- macOS caches icons aggressively. `build.sh` touches the bundle after
+  installing, but if Finder still shows the old one, log out and back in.
+
+If you previously pasted an icon onto the app in Finder (⌘I → paste), that is
+stored as a custom-icon resource **on the bundle** and overrides the bundled
+one. `build.sh --install` removes it so the icon in this repo wins.
+
+Notifications show the same icon. They are posted through the
+`UserNotifications` framework under the app's own bundle identity; the previous
+`osascript` route made every notification appear as **Script Editor**. If
+notification permission is refused, or the binary is run directly out of
+`build/` (no bundle), it falls back to `osascript` and the Script Editor icon
+comes back.
+
+The menu bar icon is separate — it stays an SF Symbol (`display.2`), which
+adapts to light/dark menu bars the way a full-color icon can't.
+
 ## Usage
 
 The app lives in the menu bar and needs no configuration — connect an external
-monitor and the internal display goes dark within a few seconds.
+monitor and the internal display goes dark within a few seconds. It is a
+menu-bar-only agent (`LSUIElement`), so it has no Dock icon and no entry in the
+app switcher.
 
 Menu items:
 
@@ -79,6 +109,9 @@ Global shortcuts:
 The shortcuts require **Accessibility** permission
 (System Settings → Privacy & Security → Accessibility). Everything else works
 without it.
+
+They are matched on hardware key codes rather than the typed character, so they
+keep working with a non-Latin keyboard layout (Persian, Arabic, …) selected.
 
 ## How it works
 
@@ -116,6 +149,9 @@ Other implementation notes:
   only schedules a debounced reconcile on the main queue.
 - Brightness is saved before being zeroed and restored on re-enable, with a
   safety floor so a bad saved value can't leave you with a black screen.
+- After six consecutive failed attempts the loop backs off for a minute and
+  notifies you, then retries — it never stops permanently, so a transient
+  refusal from the window server can't wedge the app until the next relaunch.
 - The internal display is re-enabled on **every** exit path — the Quit menu
   item, `applicationWillTerminate`, and `SIGTERM`/`SIGINT`/`SIGHUP` handlers —
   so killing the process or logging out can't leave the panel dark and
@@ -134,9 +170,10 @@ means **a future macOS release can break this app without warning.**
 
 ## Caveats
 
-- The binary is **unsigned**. Because macOS ties Accessibility permission to the
-  binary's identity, you may need to re-grant Accessibility after each rebuild
-  for the keyboard shortcuts to keep working.
+- The app is **ad-hoc signed** (`codesign --sign -`), not signed with a
+  Developer ID. Because macOS ties permissions to the binary's identity, you may
+  need to re-grant Accessibility — and re-allow notifications — after a rebuild
+  for the keyboard shortcuts and notifications to keep working.
 - If the app starts while the internal display is already off at zero
   brightness, it cannot know your previous brightness level and restores to 50%.
 - In clamshell mode the built-in display isn't enumerated at all, so the app

@@ -1,15 +1,23 @@
 import Cocoa
 import CoreGraphics
+import UserNotifications
 import ApplicationServices // برای دسترسی به مجوزهای کیبورد
 
 @_silgen_name("CGSConfigureDisplayEnabled")
 func CGSConfigureDisplayEnabled(_ config: CGDisplayConfigRef?, _ display: CGDirectDisplayID, _ enabled: Bool) -> CGError
 
+// این توابع در سمت C مقدار ۳۲ بیتی برمی‌گردانند؛ اگر Int (۶۴ بیتی) اعلام شوند
+// بیت‌های بالایی نامعتبرند و مقایسه‌ی نتیجه با صفر غیرقابل‌اتکا می‌شود.
 @_silgen_name("DisplayServicesSetBrightness")
-func DisplayServicesSetBrightness(_ display: CGDirectDisplayID, _ brightness: Float) -> Int
+func DisplayServicesSetBrightness(_ display: CGDirectDisplayID, _ brightness: Float) -> Int32
 
 @_silgen_name("DisplayServicesGetBrightness")
-func DisplayServicesGetBrightness(_ display: CGDirectDisplayID, _ brightness: UnsafeMutablePointer<Float>) -> Int
+func DisplayServicesGetBrightness(_ display: CGDirectDisplayID, _ brightness: UnsafeMutablePointer<Float>) -> Int32
+
+// کدهای سخت‌افزاری کلیدها (kVK_ANSI_D / kVK_ANSI_E). برخلاف کاراکتر تایپ‌شده،
+// این مقادیر به زبان و چیدمان فعلی کیبورد (مثلاً فارسی) وابسته نیستند.
+let keyCodeD: UInt16 = 2
+let keyCodeE: UInt16 = 14
 
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
@@ -24,11 +32,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var isApplying = false
     var failureCount = 0
     let maxFailures = 6
+    // بعد از چند شکست پیاپی کمی صبر می‌کنیم، ولی برای همیشه دست نمی‌کشیم
+    var lastFailureAt: Date?
+    let failureCooldown: TimeInterval = 60
+    var reportedGivingUp = false
 
     var reconcileWorkItem: DispatchWorkItem?
     var reconcileTimer: Timer?
     var lastKnownInternalActive: Bool?
     var signalSources: [DispatchSourceSignal] = []
+    var useUserNotifications = false
 
     func applicationDidFinishLaunching(_ aNotification: Notification) {
         resolveInternalDisplay()
@@ -38,7 +51,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         setupGlobalShortcuts() // ناظر کیبورد
         setupTerminationHandlers()
         startMonitoring()
-        sendNotification(title: "AutoDisplayToggle", message: "🖥️ Service is now active in the menu bar.")
+        // پیام خوش‌آمد بعد از تعیین‌تکلیف مجوز نوتیفیکیشن فرستاده می‌شود
+        // تا اولین نوتیفیکیشن هم با آیکن خود برنامه نمایش داده شود.
+        setupNotifications {
+            self.sendNotification(title: "AutoDisplayToggle", message: "🖥️ Service is now active in the menu bar.")
+        }
     }
 
     func setupMenu() {
@@ -80,7 +97,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // هر بار که کاربر دستی دخالت می‌کند، وضعیت داخلی برنامه را از نو می‌سنجیم
         isSleeping = false
-        failureCount = 0
+        resetFailureState()
 
         if isAutoEnabled {
             sendNotification(title: "Auto-Toggle Resumed", message: "⚡️ Automated display management is ON.")
@@ -113,25 +130,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func handleKeyEvent(_ event: NSEvent) {
-        // بررسی فشرده شدن همزمان کلیدهای Control + Option + Command
-        let hasCommand = event.modifierFlags.contains(.command)
-        let hasControl = event.modifierFlags.contains(.control)
-        let hasOption = event.modifierFlags.contains(.option)
+        // نگه‌داشتن کلید، رویداد را پشت سر هم تکرار می‌کند و وضعیت را بارها عوض می‌کند
+        guard !event.isARepeat else { return }
 
-        if hasCommand && hasControl && hasOption {
-            if let char = event.charactersIgnoringModifiers?.lowercased() {
-                if char == "d" {
-                    // Control + Option + Command + D (برای غیرفعال کردن)
-                    if self.isAutoEnabled {
-                        self.toggleAuto()
-                    }
-                } else if char == "e" {
-                    // Control + Option + Command + E (برای فعال کردن)
-                    if !self.isAutoEnabled {
-                        self.toggleAuto()
-                    }
-                }
-            }
+        // بررسی فشرده شدن همزمان کلیدهای Control + Option + Command
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard flags.isSuperset(of: [.command, .control, .option]) else { return }
+
+        // تصمیم بر اساس کد کلید گرفته می‌شود نه کاراکتر تایپ‌شده،
+        // وگرنه با چیدمان غیرلاتین (فارسی) میانبرها اصلاً کار نمی‌کنند.
+        switch event.keyCode {
+        case keyCodeD:
+            // Control + Option + Command + D (برای غیرفعال کردن)
+            if isAutoEnabled { toggleAuto() }
+        case keyCodeE:
+            // Control + Option + Command + E (برای فعال کردن)
+            if !isAutoEnabled { toggleAuto() }
+        default:
+            break
         }
     }
     // ---------------------------------------------------------
@@ -177,13 +193,61 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    // ---------- اطلاع‌رسانی ----------
+
+    // وقتی برنامه از داخل بانْدل اجرا شود، نوتیفیکیشن‌ها از مسیر UserNotifications
+    // فرستاده می‌شوند و آیکن خود برنامه را نشان می‌دهند. مسیر قدیمی osascript
+    // نوتیفیکیشن را به نام و آیکن Script Editor نمایش می‌داد.
+    func setupNotifications(then completion: @escaping () -> Void) {
+        // اجرای باینری خام (خارج از .app) بانْدل ندارد و در آن حالت
+        // UNUserNotificationCenter.current() برنامه را کرش می‌کند.
+        guard Bundle.main.bundleIdentifier != nil,
+              Bundle.main.bundleURL.pathExtension == "app" else {
+            completion()
+            return
+        }
+
+        let center = UNUserNotificationCenter.current()
+        center.delegate = self
+        center.requestAuthorization(options: [.alert]) { [weak self] granted, _ in
+            DispatchQueue.main.async {
+                self?.useUserNotifications = granted
+                completion()
+            }
+        }
+    }
+
     func sendNotification(title: String, message: String) {
+        guard useUserNotifications else {
+            sendNotificationViaAppleScript(title: title, message: message)
+            return
+        }
+
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = message
+        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request, withCompletionHandler: nil)
+    }
+
+    // مسیر جایگزین: بدون بانْدل یا بدون مجوز نوتیفیکیشن
+    func sendNotificationViaAppleScript(title: String, message: String) {
+        let safeTitle = appleScriptLiteral(title)
+        let safeMessage = appleScriptLiteral(message)
         DispatchQueue.global(qos: .background).async {
             let task = Process()
             task.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-            task.arguments = ["-e", "display notification \"\(message)\" with title \"\(title)\""]
+            task.arguments = ["-e", "display notification \(safeMessage) with title \(safeTitle)"]
             try? task.run()
         }
+    }
+
+    // نقل‌قول و بک‌اسلش باید escape شوند وگرنه اسکریپت نامعتبر می‌شود
+    func appleScriptLiteral(_ text: String) -> String {
+        let escaped = text
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        return "\"\(escaped)\""
     }
 
     // ---------- شناسایی مانیتورها ----------
@@ -276,6 +340,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // تنها نقطه‌ی تصمیم‌گیری برنامه: وضعیت واقعی را با وضعیت مطلوب مقایسه می‌کند.
     // چون بر پایه‌ی وضعیت کار می‌کند نه رویداد، هیچ‌وقت در حالت غلط گیر نمی‌کند
     // و اعمال دوباره‌اش هم بی‌خطر است.
+    func resetFailureState() {
+        failureCount = 0
+        lastFailureAt = nil
+        reportedGivingUp = false
+    }
+
     @objc func reconcile() {
         guard isAutoEnabled, !isSleeping, !isApplying else { return }
 
@@ -296,19 +366,37 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         lastKnownInternalActive = actual
 
         guard actual != desired else {
-            failureCount = 0
+            resetFailureState()
             // وضعیت فعال/غیرفعال درست است، ولی بک‌لایت ممکن است دوباره روشن شده باشد
             if !desired { enforceZeroBrightness(id) }
             return
         }
 
-        guard failureCount < maxFailures else { return }
+        // پس از چند شکست پیاپی، به جای دست کشیدن برای همیشه، یک دوره‌ی
+        // خنک‌شدن صبر می‌کنیم و دوباره تلاش می‌کنیم؛ وگرنه برنامه تا رویداد
+        // بعدی مانیتورها در حالت غلط گیر می‌کرد و باید دستی ری‌استارت می‌شد.
+        if failureCount >= maxFailures {
+            guard let last = lastFailureAt, Date().timeIntervalSince(last) >= failureCooldown else {
+                if !reportedGivingUp {
+                    reportedGivingUp = true
+                    sendNotification(title: "Display Toggle Failed",
+                                     message: "⚠️ Could not switch the internal display. Retrying shortly.")
+                }
+                return
+            }
+            failureCount = 0
+        }
 
         isApplying = true
         let ok = setInternalEnabled(desired)
         isApplying = false
 
-        failureCount = ok ? 0 : failureCount + 1
+        if ok {
+            resetFailureState()
+        } else {
+            failureCount += 1
+            lastFailureAt = Date()
+        }
         // نتیجه در بررسی بعدی تأیید می‌شود
         scheduleReconcile(after: ok ? 2.0 : 5.0)
     }
@@ -345,7 +433,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // تغییر آرایش مانیتورها (وصل/قطع شدن، تغییر رزولوشن)
         NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
             self?.isSleeping = false
-            self?.failureCount = 0
+            self?.resetFailureState()
             self?.scheduleReconcile(after: 2.0)
         }
     }
@@ -361,7 +449,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func handleWake() {
         isSleeping = false
-        failureCount = 0
+        resetFailureState()
         // شناسه‌ی مانیتور داخلی بعد از بیداری عوض شده؛ کش را دور می‌ریزیم
         internalDisplayID = 0
         lastKnownInternalActive = nil
@@ -376,7 +464,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // تور ایمنی: هر ۵ ثانیه وضعیت واقعی بررسی می‌شود.
         // اگر رویدادی از دست برود یا اعمال تنظیمات شکست بخورد، برنامه خودش را ترمیم می‌کند
         // و دیگر لازم نیست برنامه بسته و دوباره باز شود.
-        let timer = Timer.scheduledTimer(timeInterval: 5.0, target: self, selector: #selector(reconcile), userInfo: nil, repeats: true)
+        // با Timer.scheduledTimer تایمر یک بار در مود پیش‌فرض ثبت می‌شد و
+        // اضافه‌کردن دوباره‌اش به رون‌لوپ ثبت تکراری بود؛ اینجا فقط یک بار و در
+        // مودهای common ثبت می‌شود تا هنگام باز بودن منو هم متوقف نشود.
+        let timer = Timer(timeInterval: 5.0, target: self, selector: #selector(reconcile), userInfo: nil, repeats: true)
         timer.tolerance = 2.0
         RunLoop.main.add(timer, forMode: .common)
         reconcileTimer = timer
@@ -395,13 +486,23 @@ let displayCallback: CGDisplayReconfigurationCallBack = { display, flags, userIn
     DispatchQueue.main.async {
         monitor.isSleeping = false
         monitor.internalDisplayID = 0 // شناسه ممکن است عوض شده باشد
-        monitor.failureCount = 0
+        monitor.resetFailureState()
         monitor.scheduleReconcile(after: 2.0)
+    }
+}
+
+// نوتیفیکیشن وقتی برنامه فوکوس دارد به‌صورت پیش‌فرض نمایش داده نمی‌شود
+extension AppDelegate: UNUserNotificationCenterDelegate {
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner])
     }
 }
 
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate
-app.setActivationPolicy(.regular)
+// ابزار نوار منو: بدون آیکن داک و بدون حضور در Command-Tab
+app.setActivationPolicy(.accessory)
 app.run()
