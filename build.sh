@@ -18,6 +18,7 @@ swiftc -O "${APP_NAME}.swift" \
     -o "${BUILD_DIR}/${APP_NAME}" \
     -framework Cocoa \
     -framework UserNotifications \
+    -framework Carbon \
     -F /System/Library/PrivateFrameworks \
     -framework DisplayServices
 

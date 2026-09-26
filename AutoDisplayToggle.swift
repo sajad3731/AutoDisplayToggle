@@ -2,7 +2,7 @@ import Cocoa
 import CoreGraphics
 import UserNotifications
 import ServiceManagement
-import ApplicationServices // برای دسترسی به مجوزهای کیبورد
+import Carbon.HIToolbox // برای میانبرهای سراسری
 
 @_silgen_name("CGSConfigureDisplayEnabled")
 func CGSConfigureDisplayEnabled(_ config: CGDisplayConfigRef?, _ display: CGDirectDisplayID, _ enabled: Bool) -> CGError
@@ -15,10 +15,10 @@ func DisplayServicesSetBrightness(_ display: CGDirectDisplayID, _ brightness: Fl
 @_silgen_name("DisplayServicesGetBrightness")
 func DisplayServicesGetBrightness(_ display: CGDirectDisplayID, _ brightness: UnsafeMutablePointer<Float>) -> Int32
 
-// کدهای سخت‌افزاری کلیدها (kVK_ANSI_D / kVK_ANSI_E). برخلاف کاراکتر تایپ‌شده،
-// این مقادیر به زبان و چیدمان فعلی کیبورد (مثلاً فارسی) وابسته نیستند.
-let keyCodeD: UInt16 = 2
-let keyCodeE: UInt16 = 14
+// شناسه‌های میانبرها. امضا فقط باید برای این برنامه یکتا باشد.
+let hotKeySignature = OSType(0x41445447) // 'ADTG'
+let hotKeyIDTurnOff: UInt32 = 1
+let hotKeyIDTurnOn: UInt32 = 2
 
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
@@ -44,13 +44,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var signalSources: [DispatchSourceSignal] = []
     var useUserNotifications = false
     var isWatchingDisplays = false
+    var hotKeyRefs: [EventHotKeyRef] = []
 
     func applicationDidFinishLaunching(_ aNotification: Notification) {
         resolveInternalDisplay()
         captureBrightness()
         setupMenu()
         setupPowerObservers()
-        setupGlobalShortcuts() // ناظر کیبورد
+        setupGlobalShortcuts() // میانبرهای سراسری
         setupTerminationHandlers()
         startMonitoring()
         // پیام خوش‌آمد بعد از تعیین‌تکلیف مجوز نوتیفیکیشن فرستاده می‌شود
@@ -75,9 +76,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(statusMenuItem)
         menu.addItem(NSMenuItem.separator())
 
-        // میانبر سراسری اینجا فقط نوشته می‌شود و به‌عنوان keyEquivalent ثبت
-        // نمی‌شود، وگرنه هنگام باز بودن منو هم ناظر سراسری و هم خود منو
-        // رویداد را می‌گرفتند و وضعیت دو بار عوض می‌شد.
+        // میانبر سراسری جداگانه رزرو شده، پس اینجا فقط در عنوان نوشته
+        // می‌شود و به‌عنوان keyEquivalent ثبت نمی‌شود.
         let toggleMenuItem = NSMenuItem(title: "Turn Off (⌃⌥⌘D)", action: #selector(toggleEnabled), keyEquivalent: "")
         toggleMenuItem.tag = 2
         menu.addItem(toggleMenuItem)
@@ -165,9 +165,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // خاموش کردن یعنی برنامه واقعاً کاری نکند: تایمر و ناظر مانیتورها متوقف
-    // می‌شوند و مانیتور داخلی برمی‌گردد. فقط آیتم نوار منو و ناظر کیبورد
-    // زنده می‌مانند، چون در غیر این صورت هیچ‌چیز نبود که میانبر روشن‌کردن
-    // را بشنود.
+    // می‌شوند و مانیتور داخلی برمی‌گردد. آیتم نوار منو و میانبرها زنده
+    // می‌مانند، چون در غیر این صورت هیچ‌چیز نبود که میانبر روشن‌کردن را
+    // بشنود.
     func setEnabled(_ enabled: Bool, notify: Bool = true) {
         isEnabled = enabled
         // هر بار که کاربر دستی دخالت می‌کند، وضعیت داخلی برنامه را از نو می‌سنجیم
@@ -193,43 +193,52 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    // ---------- قابلیت تنظیم میانبرهای کیبورد ----------
+    // ---------- میانبرهای سراسری ----------
+
+    // RegisterEventHotKey میانبر را در سطح سیستم رزرو می‌کند و هیچ مجوز
+    // Accessibility نمی‌خواهد. ناظر رویدادی که قبلاً استفاده می‌شد بدون آن
+    // مجوز بی‌صدا هیچ‌وقت اجرا نمی‌شد، یعنی میانبرها ظاهراً کار نمی‌کردند؛
+    // ضمن اینکه بعد از دادن مجوز هم تا ری‌استارت برنامه فعال نمی‌شد.
     func setupGlobalShortcuts() {
-        // درخواست مجوز دسترسی به مانیتورینگ کیبورد
-        let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-        let accessEnabled = AXIsProcessTrustedWithOptions(opts)
+        var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
+                                      eventKind: UInt32(kEventHotKeyPressed))
+        InstallEventHandler(GetApplicationEventTarget(),
+                            hotKeyHandler,
+                            1,
+                            &eventType,
+                            Unmanaged.passUnretained(self).toOpaque(),
+                            nil)
 
-        if !accessEnabled {
-            sendNotification(title: "Permission Required", message: "⚠️ Please grant Accessibility access in System Settings for shortcuts to work.")
-        }
+        let offRegistered = registerHotKey(id: hotKeyIDTurnOff, keyCode: UInt32(kVK_ANSI_D))
+        let onRegistered = registerHotKey(id: hotKeyIDTurnOn, keyCode: UInt32(kVK_ANSI_E))
 
-        // ناظر برای زمانی که برنامه در پس‌زمینه است
-        NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            self?.handleKeyEvent(event)
-        }
-        // ناظر برای زمانی که برنامه فوکوس دارد
-        NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event -> NSEvent? in
-            self?.handleKeyEvent(event)
-            return event
+        if !offRegistered || !onRegistered {
+            sendNotification(title: "Shortcut Unavailable",
+                             message: "⚠️ ⌃⌥⌘D / ⌃⌥⌘E are already claimed by another app.")
         }
     }
 
-    func handleKeyEvent(_ event: NSEvent) {
-        // نگه‌داشتن کلید، رویداد را پشت سر هم تکرار می‌کند و وضعیت را بارها عوض می‌کند
-        guard !event.isARepeat else { return }
+    func registerHotKey(id: UInt32, keyCode: UInt32) -> Bool {
+        let hotKeyID = EventHotKeyID(signature: hotKeySignature, id: id)
+        var ref: EventHotKeyRef?
 
-        // بررسی فشرده شدن همزمان کلیدهای Control + Option + Command
-        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-        guard flags.isSuperset(of: [.command, .control, .option]) else { return }
+        let status = RegisterEventHotKey(keyCode,
+                                         UInt32(controlKey | optionKey | cmdKey),
+                                         hotKeyID,
+                                         GetApplicationEventTarget(),
+                                         0,
+                                         &ref)
 
-        // تصمیم بر اساس کد کلید گرفته می‌شود نه کاراکتر تایپ‌شده،
-        // وگرنه با چیدمان غیرلاتین (فارسی) میانبرها اصلاً کار نمی‌کنند.
-        switch event.keyCode {
-        case keyCodeD:
-            // Control + Option + Command + D (خاموش کردن)
+        guard status == noErr, let ref = ref else { return false }
+        hotKeyRefs.append(ref)
+        return true
+    }
+
+    func handleHotKey(_ id: UInt32) {
+        switch id {
+        case hotKeyIDTurnOff:
             if isEnabled { setEnabled(false) }
-        case keyCodeE:
-            // Control + Option + Command + E (روشن کردن)
+        case hotKeyIDTurnOn:
             if !isEnabled { setEnabled(true) }
         default:
             break
@@ -618,6 +627,27 @@ let displayCallback: CGDisplayReconfigurationCallBack = { display, flags, userIn
         monitor.resetFailureState()
         monitor.scheduleReconcile(after: 2.0)
     }
+}
+
+// هندلر رویداد کربن یک تابع C است، پس نباید چیزی را capture کند.
+let hotKeyHandler: EventHandlerUPP = { _, event, userInfo in
+    guard let event = event, let userInfo = userInfo else {
+        return OSStatus(eventNotHandledErr)
+    }
+
+    var hotKeyID = EventHotKeyID()
+    let status = GetEventParameter(event,
+                                   EventParamName(kEventParamDirectObject),
+                                   EventParamType(typeEventHotKeyID),
+                                   nil,
+                                   ByteCount(MemoryLayout<EventHotKeyID>.size),
+                                   nil,
+                                   &hotKeyID)
+    guard status == noErr, hotKeyID.signature == hotKeySignature else { return status }
+
+    let app = Unmanaged<AppDelegate>.fromOpaque(userInfo).takeUnretainedValue()
+    DispatchQueue.main.async { app.handleHotKey(hotKeyID.id) }
+    return noErr
 }
 
 // وضعیت «اجرا هنگام ورود» ممکن است از تنظیمات سیستم عوض شده باشد،

@@ -88,12 +88,13 @@ adapts to light/dark menu bars the way a full-color icon can't.
 
 ## Making permissions stick
 
-macOS ties Accessibility and notification permission to the app's **code
-signing identity**, not to its path. An unsigned or ad-hoc-signed app is
-identified by a hash of its own bytes, so every rebuild is a different app as
-far as the system is concerned: the Accessibility grant stops applying and the
-prompt returns, and notifications fall back to `osascript` (which is why they
-show up as **Script Editor**).
+macOS ties notification permission to the app's **code signing identity**, not
+to its path. An unsigned or ad-hoc-signed app is identified by a hash of its own
+bytes, so every rebuild is a different app as far as the system is concerned and
+notifications fall back to `osascript` (which is why they show up as **Script
+Editor**).
+
+The keyboard shortcuts are not affected — they need no permission.
 
 A self-signed certificate keeps the identity stable across rebuilds. Create one
 once:
@@ -106,13 +107,8 @@ once:
 to use a different one. Without it, the build falls back to an ad-hoc signature
 and says so.
 
-After switching identities, clear the stale permission entries once:
-
-```bash
-tccutil reset Accessibility com.user.AutoDisplayToggle
-```
-
-Then relaunch and grant again — this time it survives rebuilds.
+After switching identities, relaunch and allow notifications again — this time
+it survives rebuilds.
 
 If notifications still arrive as **Script Editor**, check
 **System Settings → Notifications → AutoDisplayToggle** and allow them; the app
@@ -149,12 +145,15 @@ Only the menu bar item and the keyboard monitor stay alive — something has to
 be running to hear <kbd>⌃</kbd><kbd>⌥</kbd><kbd>⌘</kbd><kbd>E</kbd>, so the
 shortcut cannot quit the app. Use **Quit** for that.
 
-The shortcuts require **Accessibility** permission
-(System Settings → Privacy & Security → Accessibility). Everything else works
-without it.
+The shortcuts are registered with `RegisterEventHotKey`, which reserves them
+system-wide and **needs no permissions at all** — no Accessibility grant, no
+prompt. They are bound to hardware key codes rather than typed characters, so
+they keep working with a non-Latin keyboard layout (Persian, Arabic, …)
+selected.
 
-They are matched on hardware key codes rather than the typed character, so they
-keep working with a non-Latin keyboard layout (Persian, Arabic, …) selected.
+If another app has already claimed ⌃⌥⌘D or ⌃⌥⌘E, registration fails and the
+app says so in a notification — macOS gives the combination to whoever asked
+first.
 
 ## How it works
 
@@ -215,8 +214,7 @@ means **a future macOS release can break this app without warning.**
 
 - The app is **not signed with a Developer ID**. Without the self-signed
   certificate described under *Making permissions stick*, it is signed ad-hoc
-  and both Accessibility and notification permission have to be granted again
-  after every rebuild.
+  and notification permission has to be granted again after every rebuild.
 - If the app starts while the internal display is already off at zero
   brightness, it cannot know your previous brightness level and restores to 50%.
 - In clamshell mode the built-in display isn't enumerated at all, so the app
