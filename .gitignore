@@ -1,0 +1,8 @@
+# Build artifacts
+build/
+AutoDisplayToggle
+*.o
+*.dSYM/
+
+# macOS
+.DS_Store
