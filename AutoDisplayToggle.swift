@@ -1,6 +1,7 @@
 import Cocoa
 import CoreGraphics
 import UserNotifications
+import ServiceManagement
 import ApplicationServices // برای دسترسی به مجوزهای کیبورد
 
 @_silgen_name("CGSConfigureDisplayEnabled")
@@ -21,7 +22,7 @@ let keyCodeE: UInt16 = 14
 
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
-    var isAutoEnabled = true
+    var isEnabled = true
 
     // شناسه‌ی مانیتور داخلی بعد از هر sleep/wake عوض می‌شود،
     // پس این مقدار فقط یک کش است و قبل از هر عملیات دوباره پیدا می‌شود.
@@ -42,6 +43,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var lastKnownInternalActive: Bool?
     var signalSources: [DispatchSourceSignal] = []
     var useUserNotifications = false
+    var isWatchingDisplays = false
 
     func applicationDidFinishLaunching(_ aNotification: Notification) {
         resolveInternalDisplay()
@@ -60,18 +62,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func setupMenu() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        if let button = statusItem.button {
-            button.image = NSImage(systemSymbolName: "display.2", accessibilityDescription: "Display Toggle")
-        }
 
         let menu = NSMenu()
+        // آیتم «Start at Login» در مک‌اواس قدیمی‌تر غیرفعال می‌ماند،
+        // پس فعال/غیرفعال بودن آیتم‌ها را خودمان مدیریت می‌کنیم.
+        menu.autoenablesItems = false
+        menu.delegate = self
 
-        let statusMenuItem = NSMenuItem(title: "Status: Auto Enabled", action: nil, keyEquivalent: "")
+        let statusMenuItem = NSMenuItem(title: "Status: On", action: nil, keyEquivalent: "")
         statusMenuItem.tag = 1
+        statusMenuItem.isEnabled = false
         menu.addItem(statusMenuItem)
         menu.addItem(NSMenuItem.separator())
 
-        let toggleMenuItem = NSMenuItem(title: "Pause Auto-Toggle", action: #selector(toggleAuto), keyEquivalent: "p")
+        // میانبر سراسری اینجا فقط نوشته می‌شود و به‌عنوان keyEquivalent ثبت
+        // نمی‌شود، وگرنه هنگام باز بودن منو هم ناظر سراسری و هم خود منو
+        // رویداد را می‌گرفتند و وضعیت دو بار عوض می‌شد.
+        let toggleMenuItem = NSMenuItem(title: "Turn Off (⌃⌥⌘D)", action: #selector(toggleEnabled), keyEquivalent: "")
         toggleMenuItem.tag = 2
         menu.addItem(toggleMenuItem)
 
@@ -79,32 +86,110 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(resetMenuItem)
         menu.addItem(NSMenuItem.separator())
 
+        let loginMenuItem = NSMenuItem(title: "Start at Login", action: #selector(toggleLoginItem), keyEquivalent: "")
+        loginMenuItem.tag = 3
+        menu.addItem(loginMenuItem)
+        menu.addItem(NSMenuItem.separator())
+
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(quitApp), keyEquivalent: "q"))
 
         statusItem.menu = menu
+        updateMenuState()
+        refreshLoginItemState()
     }
 
-    @objc func toggleAuto() {
-        isAutoEnabled.toggle()
-        let menu = statusItem.menu!
-
-        menu.item(withTag: 1)?.title = isAutoEnabled ? "Status: Auto Enabled" : "Status: Paused"
-        menu.item(withTag: 2)?.title = isAutoEnabled ? "Pause Auto-Toggle" : "Resume Auto-Toggle"
-
+    func updateMenuState() {
         if let button = statusItem.button {
-            button.image = NSImage(systemSymbolName: isAutoEnabled ? "display.2" : "display", accessibilityDescription: nil)
+            button.image = NSImage(systemSymbolName: isEnabled ? "display.2" : "display",
+                                   accessibilityDescription: isEnabled ? "Display Toggle: on" : "Display Toggle: off")
         }
 
+        guard let menu = statusItem.menu else { return }
+        menu.item(withTag: 1)?.title = isEnabled ? "Status: On" : "Status: Off"
+        menu.item(withTag: 2)?.title = isEnabled ? "Turn Off (⌃⌥⌘D)" : "Turn On (⌃⌥⌘E)"
+    }
+
+    // ---------- اجرا هنگام ورود به سیستم ----------
+
+    @objc func toggleLoginItem() {
+        guard #available(macOS 13.0, *) else { return }
+
+        let service = SMAppService.mainApp
+        do {
+            switch service.status {
+            case .enabled:
+                try service.unregister()
+                sendNotification(title: "Start at Login",
+                                 message: "⛔️ AutoDisplayToggle will no longer start automatically.")
+            case .requiresApproval:
+                // خود مک‌اواس اجازه را نگه داشته؛ کاربر باید در تنظیمات تأیید کند
+                SMAppService.openSystemSettingsLoginItems()
+            default:
+                try service.register()
+                sendNotification(title: "Start at Login",
+                                 message: "✅ AutoDisplayToggle will start automatically at login.")
+            }
+        } catch {
+            sendNotification(title: "Start at Login Failed", message: "⚠️ \(error.localizedDescription)")
+        }
+
+        refreshLoginItemState()
+    }
+
+    func refreshLoginItemState() {
+        guard let item = statusItem.menu?.item(withTag: 3) else { return }
+
+        guard #available(macOS 13.0, *) else {
+            item.title = "Start at Login (needs macOS 13)"
+            item.isEnabled = false
+            item.state = .off
+            return
+        }
+
+        item.isEnabled = true
+        switch SMAppService.mainApp.status {
+        case .enabled:
+            item.title = "Start at Login"
+            item.state = .on
+        case .requiresApproval:
+            item.title = "Start at Login (approve in System Settings)"
+            item.state = .mixed
+        default:
+            item.title = "Start at Login"
+            item.state = .off
+        }
+    }
+
+    @objc func toggleEnabled() {
+        setEnabled(!isEnabled)
+    }
+
+    // خاموش کردن یعنی برنامه واقعاً کاری نکند: تایمر و ناظر مانیتورها متوقف
+    // می‌شوند و مانیتور داخلی برمی‌گردد. فقط آیتم نوار منو و ناظر کیبورد
+    // زنده می‌مانند، چون در غیر این صورت هیچ‌چیز نبود که میانبر روشن‌کردن
+    // را بشنود.
+    func setEnabled(_ enabled: Bool, notify: Bool = true) {
+        isEnabled = enabled
         // هر بار که کاربر دستی دخالت می‌کند، وضعیت داخلی برنامه را از نو می‌سنجیم
         isSleeping = false
         resetFailureState()
+        updateMenuState()
 
-        if isAutoEnabled {
-            sendNotification(title: "Auto-Toggle Resumed", message: "⚡️ Automated display management is ON.")
+        if enabled {
+            startMonitoring()
+            if notify {
+                sendNotification(title: "AutoDisplayToggle On",
+                                 message: "⚡️ Automatic display switching is active.")
+            }
             scheduleReconcile(after: 0.5)
         } else {
-            sendNotification(title: "Auto-Toggle Paused", message: "⏸️ Automated display management is OFF.")
+            stopMonitoring()
             _ = setInternalEnabled(true)
+            lastKnownInternalActive = nil
+            if notify {
+                sendNotification(title: "AutoDisplayToggle Off",
+                                 message: "⏸️ Idle. Press ⌃⌥⌘E to turn it back on.")
+            }
         }
     }
 
@@ -141,11 +226,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // وگرنه با چیدمان غیرلاتین (فارسی) میانبرها اصلاً کار نمی‌کنند.
         switch event.keyCode {
         case keyCodeD:
-            // Control + Option + Command + D (برای غیرفعال کردن)
-            if isAutoEnabled { toggleAuto() }
+            // Control + Option + Command + D (خاموش کردن)
+            if isEnabled { setEnabled(false) }
         case keyCodeE:
-            // Control + Option + Command + E (برای فعال کردن)
-            if !isAutoEnabled { toggleAuto() }
+            // Control + Option + Command + E (روشن کردن)
+            if !isEnabled { setEnabled(true) }
         default:
             break
         }
@@ -153,17 +238,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // ---------------------------------------------------------
 
     @objc func manualReset() {
-        if isAutoEnabled { toggleAuto() } // toggleAuto خودش مانیتور داخلی را روشن می‌کند
+        // setEnabled(false) خودش مانیتور داخلی را برمی‌گرداند؛ اطلاع‌رسانی‌اش را
+        // خاموش می‌کنیم تا دو نوتیفیکیشن پشت سر هم نیاید.
+        if isEnabled { setEnabled(false, notify: false) }
         else { _ = setInternalEnabled(true) }
-        sendNotification(title: "Panic Reset", message: "✅ Internal display restored successfully.")
+        sendNotification(title: "Panic Reset",
+                         message: "✅ Internal display restored. Press ⌃⌥⌘E to turn switching back on.")
     }
 
     @objc func quitApp() {
-        isAutoEnabled = false
-        reconcileTimer?.invalidate()
-        reconcileWorkItem?.cancel()
-        CGDisplayRemoveReconfigurationCallback(displayCallback, Unmanaged.passUnretained(self).toOpaque())
-        _ = setInternalEnabled(true)
+        restoreBeforeExit()
         NSApplication.shared.terminate(nil)
     }
 
@@ -174,9 +258,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func restoreBeforeExit() {
-        isAutoEnabled = false
-        reconcileTimer?.invalidate()
-        reconcileWorkItem?.cancel()
+        isEnabled = false
+        stopMonitoring()
         _ = setInternalEnabled(true)
     }
 
@@ -377,7 +460,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func reconcile() {
-        guard isAutoEnabled, !isSleeping, !isApplying else { return }
+        guard isEnabled, !isSleeping, !isApplying else { return }
 
         let id = resolveInternalDisplay()
         guard id != 0 else { return }
@@ -471,7 +554,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func handleSleep() {
         isSleeping = true
         reconcileWorkItem?.cancel()
-        guard isAutoEnabled else { return }
+        guard isEnabled else { return }
         // قبل از خواب سیستم، مانیتور داخلی را روشن می‌کنیم تا مک‌اواس با حالت عادی بخوابد
         _ = setInternalEnabled(true)
         lastKnownInternalActive = nil
@@ -489,7 +572,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func startMonitoring() {
-        CGDisplayRegisterReconfigurationCallback(displayCallback, Unmanaged.passUnretained(self).toOpaque())
+        // با روشن/خاموش کردن پیاپی، ثبت دوباره‌ی callback تکراری می‌شد
+        if !isWatchingDisplays {
+            CGDisplayRegisterReconfigurationCallback(displayCallback, Unmanaged.passUnretained(self).toOpaque())
+            isWatchingDisplays = true
+        }
+        reconcileTimer?.invalidate()
 
         // تور ایمنی: هر ۵ ثانیه وضعیت واقعی بررسی می‌شود.
         // اگر رویدادی از دست برود یا اعمال تنظیمات شکست بخورد، برنامه خودش را ترمیم می‌کند
@@ -503,6 +591,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         reconcileTimer = timer
 
         scheduleReconcile(after: 1.0)
+    }
+
+    func stopMonitoring() {
+        reconcileTimer?.invalidate()
+        reconcileTimer = nil
+        reconcileWorkItem?.cancel()
+
+        if isWatchingDisplays {
+            CGDisplayRemoveReconfigurationCallback(displayCallback, Unmanaged.passUnretained(self).toOpaque())
+            isWatchingDisplays = false
+        }
     }
 }
 
@@ -518,6 +617,15 @@ let displayCallback: CGDisplayReconfigurationCallBack = { display, flags, userIn
         monitor.internalDisplayID = 0 // شناسه ممکن است عوض شده باشد
         monitor.resetFailureState()
         monitor.scheduleReconcile(after: 2.0)
+    }
+}
+
+// وضعیت «اجرا هنگام ورود» ممکن است از تنظیمات سیستم عوض شده باشد،
+// پس هر بار که منو باز می‌شود دوباره خوانده می‌شود.
+extension AppDelegate: NSMenuDelegate {
+    func menuWillOpen(_ menu: NSMenu) {
+        refreshLoginItemState()
+        refreshNotificationAuthorization()
     }
 }
 

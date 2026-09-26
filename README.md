@@ -53,8 +53,10 @@ cd auto_display_toggle
 `/Applications/AutoDisplayToggle.app` and launches it. Without `--install` it
 just builds into `build/`.
 
-To start it automatically, add the app under
-**System Settings → General → Login Items**.
+To start it automatically, use **Start at Login** in the app's own menu — it
+registers the app with `SMAppService` (macOS 13+), the same mechanism as
+System Settings → General → Login Items. On macOS 11–12 the menu item is
+disabled; add the app there by hand instead.
 
 ## App icon
 
@@ -129,16 +131,23 @@ Menu items:
 
 | Item | What it does |
 | --- | --- |
-| **Pause / Resume Auto-Toggle** | Suspends automatic switching and restores the internal display |
-| **Reset Displays (Panic)** | Pauses and force-restores the internal display |
+| **Turn Off / Turn On** | Master switch — see below |
+| **Reset Displays (Panic)** | Turns the app off and force-restores the internal display |
+| **Start at Login** | Registers/unregisters the app as a login item (checkmark shows the current state) |
 | **Quit** | Restores the internal display, then exits |
 
 Global shortcuts:
 
 | Shortcut | Action |
 | --- | --- |
-| <kbd>⌃</kbd><kbd>⌥</kbd><kbd>⌘</kbd><kbd>D</kbd> | Pause (disable auto-toggle) |
-| <kbd>⌃</kbd><kbd>⌥</kbd><kbd>⌘</kbd><kbd>E</kbd> | Resume (enable auto-toggle) |
+| <kbd>⌃</kbd><kbd>⌥</kbd><kbd>⌘</kbd><kbd>D</kbd> | Turn the app off |
+| <kbd>⌃</kbd><kbd>⌥</kbd><kbd>⌘</kbd><kbd>E</kbd> | Turn the app on |
+
+**Off** means idle, not quit: the reconcile timer is stopped, the display
+reconfiguration callback is unregistered, and the internal display is restored.
+Only the menu bar item and the keyboard monitor stay alive — something has to
+be running to hear <kbd>⌃</kbd><kbd>⌥</kbd><kbd>⌘</kbd><kbd>E</kbd>, so the
+shortcut cannot quit the app. Use **Quit** for that.
 
 The shortcuts require **Accessibility** permission
 (System Settings → Privacy & Security → Accessibility). Everything else works
