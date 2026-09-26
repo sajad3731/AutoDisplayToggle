@@ -640,7 +640,9 @@ let hotKeyHandler: EventHandlerUPP = { _, event, userInfo in
                                    EventParamName(kEventParamDirectObject),
                                    EventParamType(typeEventHotKeyID),
                                    nil,
-                                   ByteCount(MemoryLayout<EventHotKeyID>.size),
+                                   // نوع این پارامتر (ByteCount) در سوییفت نامی
+                                   // ندارد، پس با .init از روی خود پارامتر ساخته می‌شود
+                                   .init(MemoryLayout<EventHotKeyID>.size),
                                    nil,
                                    &hotKeyID)
     guard status == noErr, hotKeyID.signature == hotKeySignature else { return status }
