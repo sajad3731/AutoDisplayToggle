@@ -32,7 +32,7 @@ a one-time action.
 
 ## Requirements
 
-- macOS 11 or later (developed and tested on macOS 26.7, Intel MacBook Pro)
+- macOS 14 or later (developed and tested on macOS 26.7, Intel MacBook Pro)
 - Xcode Command Line Tools, for `swiftc`:
   ```bash
   xcode-select --install
@@ -54,9 +54,9 @@ cd auto_display_toggle
 just builds into `build/`.
 
 To start it automatically, use **Start at Login** in the app's own menu — it
-registers the app with `SMAppService` (macOS 13+), the same mechanism as
-System Settings → General → Login Items. On macOS 11–12 the menu item is
-disabled; add the app there by hand instead.
+registers the app with `SMAppService`, the same mechanism as System Settings →
+General → Login Items. If macOS wants the login item approved, the row says
+`Approve…` and clicking it opens that settings pane.
 
 ## App icon
 
@@ -83,8 +83,17 @@ notification permission is refused, or the binary is run directly out of
 `build/` (no bundle), it falls back to `osascript` and the Script Editor icon
 comes back.
 
-The menu bar icon is separate — it stays an SF Symbol (`display.2`), which
-adapts to light/dark menu bars the way a full-color icon can't.
+The menu bar icon is separate — it stays an SF Symbol, which adapts to
+light/dark menu bars the way a full-color icon can't. It has three states, so
+the menu bar alone says what the app is doing:
+
+| Icon | Meaning |
+| --- | --- |
+| `display.2` | Switching on, internal display lit |
+| `display` | Switching on, internal display dark |
+| `display`, dimmed | Switching off — the app is idle |
+
+Hovering it shows the same summary as the top of the menu.
 
 ## Making permissions stick
 
@@ -127,10 +136,39 @@ Menu items:
 
 | Item | What it does |
 | --- | --- |
-| **Turn Off / Turn On** | Master switch — see below |
+| *Status header* | Whether the internal display is lit, and how many external displays are connected |
+| **Automatic switching** | Master switch — see below. The shortcut beside it is the one that does the same thing from the keyboard |
+| **Restore brightness** | The level the internal panel comes back to |
+| **Pause for 1 hour** | Switching off, resuming by itself an hour later |
+| **Pause until displays change** | Switching off until a display is connected or disconnected |
+| **Resume now** | Ends a pause early. Only shown while paused, with the time left beside it |
+| *Display list* | Every connected display, built-in first, and whether it is on |
+| **Notifications** | Silences the routine announcements. Warnings still come through |
+| **Start at Login** | Registers/unregisters the app as a login item |
 | **Reset Displays (Panic)** | Turns the app off and force-restores the internal display |
-| **Start at Login** | Registers/unregisters the app as a login item (checkmark shows the current state) |
 | **Quit** | Restores the internal display, then exits |
+
+The switches are real switches and the brightness control is a real slider:
+using one leaves the menu open, so the status header and the display list above
+update in place instead of making you reopen the menu to see what happened. The
+whole menu refreshes once a second for as long as it is open. Every other row
+closes the menu as usual.
+
+**Pausing** is switching off with an end in sight: the internal display comes
+back, and switching resumes on its own — at the deadline, or the next time a
+display is connected or disconnected, which is the one for handing your laptop
+to a projector. Flipping the master switch by hand cancels a pause. A pause is
+not remembered across a relaunch; the app always starts switching.
+
+**Restore brightness** is the level the internal panel is set to when it comes
+back on. The app learns it from the panel whenever it is lit, so the slider is
+usually already where you want it; setting it by hand pins it. Unlike the
+switches, it does not change the brightness of a display right now — it decides
+where the internal panel lands when it is re-enabled.
+
+Only two settings are remembered across launches: **Notifications** and
+**Restore brightness**. They live in the app's own `UserDefaults`, so there is
+no config file to edit.
 
 Global shortcuts:
 
@@ -153,7 +191,8 @@ selected.
 
 If another app has already claimed ⌃⌥⌘D or ⌃⌥⌘E, registration fails and the
 app says so in a notification — macOS gives the combination to whoever asked
-first.
+first. The menu then stops printing the shortcut beside the switch, rather than
+advertising one that belongs to someone else.
 
 ## How it works
 
@@ -216,7 +255,8 @@ means **a future macOS release can break this app without warning.**
   certificate described under *Making permissions stick*, it is signed ad-hoc
   and notification permission has to be granted again after every rebuild.
 - If the app starts while the internal display is already off at zero
-  brightness, it cannot know your previous brightness level and restores to 50%.
+  brightness, it cannot read a brightness level from the panel, and falls back
+  to the remembered **Restore brightness** value (50% on a first run).
 - In clamshell mode the built-in display isn't enumerated at all, so the app
   correctly does nothing.
 
