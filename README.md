@@ -32,7 +32,7 @@ a one-time action.
 
 ## Requirements
 
-- macOS 11 or later (developed and tested on macOS 26.7, Intel MacBook Pro)
+- macOS 14 or later (developed and tested on macOS 26.7, Intel MacBook Pro)
 - Xcode Command Line Tools, for `swiftc`:
   ```bash
   xcode-select --install
@@ -54,9 +54,9 @@ cd auto_display_toggle
 just builds into `build/`.
 
 To start it automatically, use **Start at Login** in the app's own menu — it
-registers the app with `SMAppService` (macOS 13+), the same mechanism as
-System Settings → General → Login Items. On macOS 11–12 the menu item is
-disabled; add the app there by hand instead.
+registers the app with `SMAppService`, the same mechanism as System Settings →
+General → Login Items. If macOS wants the login item approved, the row says
+`Approve…` and clicking it opens that settings pane.
 
 ## App icon
 
@@ -83,8 +83,17 @@ notification permission is refused, or the binary is run directly out of
 `build/` (no bundle), it falls back to `osascript` and the Script Editor icon
 comes back.
 
-The menu bar icon is separate — it stays an SF Symbol (`display.2`), which
-adapts to light/dark menu bars the way a full-color icon can't.
+The menu bar icon is separate — it stays an SF Symbol, which adapts to
+light/dark menu bars the way a full-color icon can't. It has three states, so
+the menu bar alone says what the app is doing:
+
+| Icon | Meaning |
+| --- | --- |
+| `display.2` | Switching on, internal display lit |
+| `display` | Switching on, internal display dark |
+| `display`, dimmed | Switching off — the app is idle |
+
+Hovering it shows the same summary as the top of the menu.
 
 ## Making permissions stick
 
@@ -127,10 +136,15 @@ Menu items:
 
 | Item | What it does |
 | --- | --- |
-| **Turn Off / Turn On** | Master switch — see below |
+| *Status header* | Whether the internal display is lit, and how many external displays are connected. Refreshes while the menu is open |
+| **Automatic switching** | Master switch — see below. The shortcut next to it is the one that does the same thing from the keyboard |
+| **Start at Login** | Registers/unregisters the app as a login item |
 | **Reset Displays (Panic)** | Turns the app off and force-restores the internal display |
-| **Start at Login** | Registers/unregisters the app as a login item (checkmark shows the current state) |
 | **Quit** | Restores the internal display, then exits |
+
+The two switches are real switches: flipping one leaves the menu open, so the
+status header above them updates in place instead of making you reopen the menu
+to see what happened. Every other row closes the menu as usual.
 
 Global shortcuts:
 
