@@ -143,6 +143,10 @@ Menu items:
 | **Pause until displays change** | Switching off until a display is connected or disconnected |
 | **Resume now** | Ends a pause early. Only shown while paused, with the time left beside it |
 | *Display list* | Every connected display, built-in first, and whether it is on |
+| *Refresh rate* | Each external display's current rate, then every rate it offers at its current resolution. Picking one asks you to keep it, and reverts by itself otherwise |
+| **Unlock N Hz…** | Shown when a monitor's EDID allows a higher rate at its native resolution than macOS lists. Adds that rate to its display override |
+| **Remove unlocked rates…** | Takes an unlocked rate back out of the display override |
+| **Always use highest rate** | Puts each external display on its best rate whenever it is connected or wakes, skipping any rate you reverted |
 | **Notifications** | Silences the routine announcements. Warnings still come through |
 | **Start at Login** | Registers/unregisters the app as a login item |
 | **Reset Displays (Panic)** | Turns the app off and force-restores the internal display |
@@ -166,8 +170,9 @@ usually already where you want it; setting it by hand pins it. Unlike the
 switches, it does not change the brightness of a display right now — it decides
 where the internal panel lands when it is re-enabled.
 
-Only two settings are remembered across launches: **Notifications** and
-**Restore brightness**. They live in the app's own `UserDefaults`, so there is
+Only these are remembered across launches: **Notifications**,
+**Restore brightness**, **Always use highest rate**, and which refresh rates
+you kept or reverted. They live in the app's own `UserDefaults`, so there is
 no config file to edit.
 
 Global shortcuts:
@@ -193,6 +198,55 @@ If another app has already claimed ⌃⌥⌘D or ⌃⌥⌘E, registration fails 
 app says so in a notification — macOS gives the combination to whoever asked
 first. The menu then stops printing the shortcut beside the switch, rather than
 advertising one that belongs to someone else.
+
+**Refresh rate** works with whatever monitor is connected; nothing is set up
+per monitor. It lists the modes macOS has for the display at its current
+resolution, changes the rate and never the resolution, and keeps a HiDPI mode
+HiDPI. Picking a rate writes it to the display preferences at once and asks
+**Keep** or **Revert**. Some monitors spend ten seconds or more hunting for
+their input after a rate change, so the countdown does not start until the
+display has shown the new mode unchanged for 3 seconds (or 20 seconds have
+passed, for a monitor that hunts without macOS noticing). It then runs for 45
+seconds, starts over if the display changes again, and gives up after two
+minutes at most. Running out reverts, so a rate that leaves the screen black
+undoes itself.
+
+Answers are remembered per monitor (vendor, product and serial) and
+resolution. **Revert** marks the rate *auto skips*: **Always use highest
+rate** never picks it again, though you still can from the menu, and keeping
+it later clears the mark. A countdown that runs out is not an answer and is not
+remembered.
+
+### Unlocking a rate the EDID leaves out
+
+Some monitors list their highest rate at the native resolution only through
+the range limits in their EDID, which Windows turns into a mode and macOS does
+not. The app reads each external display's EDID and, when the limits allow a
+common rate (72 to 240 Hz) above everything macOS lists at the native
+resolution, offers **Unlock N Hz…**. The timing is VESA CVT reduced blanking,
+version 1 or, if that needs too much bandwidth, version 2. It has to fit every
+limit the EDID states: the vertical rate, the line rate, the pixel clock, and
+the HDMI link clock if the monitor has an HDMI block.
+
+Unlocking adds that timing to the display's override file,
+`/Library/Displays/Contents/Resources/Overrides/DisplayVendorID-<vendor>/DisplayProductID-<product>`,
+as `IODisplayEDID` data. It goes into a free slot of the EDID's CEA block, or
+replaces the CEA timing least worth keeping (one below 60 Hz first). Anything
+else in the override, such as a HiDPI scale list, is kept, and the original
+file is copied to `~/Library/Application Support/AutoDisplayToggle/OverrideBackups`
+before the first change. The folder belongs to root, so macOS asks for an
+administrator password unless the file is already yours. macOS reads the
+override when the display connects, so the rate shows up as *reconnect display*
+until you replug it or restart. Until you have kept an unlocked rate once,
+**Always use highest rate** only switches to it through the Keep / Revert
+dialog, at most once per launch.
+
+This only works on Intel Macs. Apple Silicon ignores the EDID in display
+overrides, and the unlock rows never appear there.
+
+For example, the Samsung LS27B61x lists 2560×1440 at 60 and 37.5 Hz but allows
+48–75 Hz, 112 kHz and 310 MHz. The unlock replaces the 37.5 Hz timing with
+74.97 Hz at 304.25 MHz.
 
 ## How it works
 

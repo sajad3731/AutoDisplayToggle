@@ -2,6 +2,7 @@ import Cocoa
 import CoreGraphics
 import UserNotifications
 import ServiceManagement
+import IOKit.graphics
 import Carbon.HIToolbox // برای میانبرهای سراسری
 
 @_silgen_name("CGSConfigureDisplayEnabled")
@@ -21,6 +22,10 @@ func DisplayServicesGetBrightness(_ display: CGDirectDisplayID, _ brightness: Un
 enum Preference {
     static let notificationsEnabled = "NotificationsEnabled"
     static let restoreBrightness = "RestoreBrightness"
+    static let preferHighestRefreshRate = "PreferHighestRefreshRate"
+    /// Rates the user kept or turned down, per monitor and resolution.
+    static let trustedRefreshRates = "TrustedRefreshRates"
+    static let rejectedRefreshRates = "RejectedRefreshRates"
 }
 
 // شناسه‌های میانبرها. امضا فقط باید برای این برنامه یکتا باشد.
@@ -491,6 +496,454 @@ struct DisplayInfo: Equatable {
     var name: String
 }
 
+/// The refresh rates an external display offers at the resolution it is
+/// running now. Changing resolution is System Settings' job; this only moves
+/// along the rate axis, so the desktop never changes size under the user.
+struct RefreshRateInfo: Equatable {
+    var displayID: CGDirectDisplayID
+    var name: String
+    var currentHz: Double
+    /// Highest first, one entry per whole-number rate.
+    var availableHz: [Double]
+    /// The display's identity plus the pixel size it runs at. A verdict on a
+    /// rate is only worth remembering for this monitor at this resolution.
+    var verdictKeyPrefix: String
+    var isNativeResolution: Bool
+    var nativeSizeLabel: String?
+    /// A standard rate the EDID's own limits allow at the native resolution
+    /// that macOS does not list, and that an override could add.
+    var unlockCandidateHz: Int?
+    /// Native rates the display override adds on top of the monitor's EDID.
+    var unlockedHz: [Int]
+    /// Unlocked, but macOS has not picked them up yet: that happens when the
+    /// display is connected, so it needs a replug or a restart.
+    var pendingHz: [Int]
+    var trustedHz: Set<Int>
+    var rejectedHz: Set<Int>
+
+    var currentLabel: Int { RefreshRateInfo.label(currentHz) }
+    var highestHz: Double? { availableHz.first }
+
+    /// What "Always use highest rate" aims for: the best rate on offer that the
+    /// user has not turned down on this monitor.
+    var autoTargetHz: Int? {
+        availableHz.map(RefreshRateInfo.label).first { !rejectedHz.contains($0) }
+    }
+
+    /// The monitor never claimed this rate itself, so it is only switched to
+    /// silently once somebody has seen it work.
+    func needsTrial(_ hz: Int) -> Bool {
+        isNativeResolution && unlockedHz.contains(hz) && !trustedHz.contains(hz)
+    }
+
+    func verdictKey(_ hz: Int) -> String { "\(verdictKeyPrefix)@\(hz)" }
+
+    /// 74.97 is what a 75 Hz CVT timing really runs at, so rates are compared
+    /// and labelled as whole numbers.
+    static func label(_ hz: Double) -> Int { Int(hz.rounded()) }
+}
+
+/// Keep and Revert are answers; a countdown that ran out is not.
+enum RefreshRateAnswer {
+    case keep
+    case revert
+    case timedOut
+}
+
+/// What the keep-or-revert dialog watches to tell a display that is still
+/// renegotiating from one that has settled on the new mode.
+struct DisplaySnapshot: Equatable {
+    var isOnline: Bool
+    var isActive: Bool
+    var modeID: Int32
+    var bounds: CGRect
+}
+
+// MARK: - EDID
+
+/// One 18-byte detailed timing descriptor: the record an EDID uses to describe
+/// a mode down to the pixel clock.
+struct DetailedTiming: Equatable {
+    var pixelClock10kHz: Int
+    var hActive: Int
+    var hBlank: Int
+    var hFront: Int
+    var hSync: Int
+    var vActive: Int
+    var vBlank: Int
+    var vFront: Int
+    var vSync: Int
+    var hImageMM = 0
+    var vImageMM = 0
+    /// Digital separate sync, +hsync, -vsync: what reduced blanking calls for.
+    var flags: UInt8 = 0x1A
+
+    var isInterlaced: Bool { flags & 0x80 != 0 }
+    var pixelClockMHz: Double { Double(pixelClock10kHz) / 100 }
+    var hFreqKHz: Double { Double(pixelClock10kHz) * 10 / Double(hActive + hBlank) }
+    var refreshHz: Double {
+        let total = Double((hActive + hBlank) * (vActive + vBlank))
+        return total > 0 ? Double(pixelClock10kHz) * 10_000 / total : 0
+    }
+
+    var bytes: [UInt8] {
+        [UInt8(pixelClock10kHz & 0xFF), UInt8(pixelClock10kHz >> 8),
+         UInt8(hActive & 0xFF), UInt8(hBlank & 0xFF),
+         UInt8((hActive >> 8) << 4 | (hBlank >> 8)),
+         UInt8(vActive & 0xFF), UInt8(vBlank & 0xFF),
+         UInt8((vActive >> 8) << 4 | (vBlank >> 8)),
+         UInt8(hFront & 0xFF), UInt8(hSync & 0xFF),
+         UInt8((vFront & 0x0F) << 4 | (vSync & 0x0F)),
+         UInt8((hFront >> 8) << 6 | (hSync >> 8) << 4 | (vFront >> 4) << 2 | (vSync >> 4)),
+         UInt8(hImageMM & 0xFF), UInt8(vImageMM & 0xFF),
+         UInt8((hImageMM >> 8) << 4 | (vImageMM >> 8)),
+         0, 0, flags]
+    }
+}
+
+extension DetailedTiming {
+    /// Nil for a display descriptor (name, serial, range limits), which shares
+    /// the slot but starts with a zero pixel clock.
+    init?(_ b: [UInt8]) {
+        guard b.count == 18 else { return nil }
+        let clock = Int(b[0]) | Int(b[1]) << 8
+        guard clock != 0 else { return nil }
+        self.init(pixelClock10kHz: clock,
+                  hActive: Int(b[2]) | Int(b[4] >> 4) << 8,
+                  hBlank: Int(b[3]) | Int(b[4] & 0x0F) << 8,
+                  hFront: Int(b[8]) | Int(b[11] >> 6) << 8,
+                  hSync: Int(b[9]) | Int((b[11] >> 4) & 0x03) << 8,
+                  vActive: Int(b[5]) | Int(b[7] >> 4) << 8,
+                  vBlank: Int(b[6]) | Int(b[7] & 0x0F) << 8,
+                  vFront: Int(b[10] >> 4) | Int((b[11] >> 2) & 0x03) << 4,
+                  vSync: Int(b[10] & 0x0F) | Int(b[11] & 0x03) << 4,
+                  hImageMM: Int(b[12]) | Int(b[14] >> 4) << 8,
+                  vImageMM: Int(b[13]) | Int(b[14] & 0x0F) << 8,
+                  flags: b[17])
+    }
+
+    /// VESA CVT reduced blanking, the timing family monitors use for their
+    /// high-refresh modes. Version 1 is what nearly every EDID carries;
+    /// version 2 trims the blanking further and needs less bandwidth.
+    static func reducedBlanking(width: Int, height: Int, hz: Double, version: Int) -> DetailedTiming? {
+        let minVBlankMicroseconds = 460.0
+        let hPeriodEstimate = (1_000_000 / hz - minVBlankMicroseconds) / Double(height)
+        guard hPeriodEstimate > 0 else { return nil }
+
+        let hBlank, hFront, hSync, vSync, vFront, vBlank: Int
+        if version == 1 {
+            (hBlank, hFront, hSync) = (160, 48, 32)
+            vSync = cvtVSyncLines(width: width, height: height)
+            vFront = 3
+            vBlank = max(Int(minVBlankMicroseconds / hPeriodEstimate) + 1, vFront + vSync + 6)
+        } else {
+            (hBlank, hFront, hSync) = (80, 8, 32)
+            vSync = 8
+            vBlank = max(Int((minVBlankMicroseconds / hPeriodEstimate).rounded(.up)), 1 + vSync + 6)
+            vFront = vBlank - vSync - 6
+        }
+
+        let clockMHz = hz * Double((width + hBlank) * (height + vBlank)) / 1_000_000
+        // Version 1 clocks come in 0.25 MHz steps. Rounding down keeps the
+        // result at or just under the rate asked for, never over a limit.
+        let stepped = version == 1 ? (clockMHz / 0.25).rounded(.down) * 0.25 : clockMHz
+        let clock10kHz = Int((stepped * 100).rounded(.down))
+        guard clock10kHz > 0, clock10kHz <= 0xFFFF, vFront < 64, vSync < 64 else { return nil }
+
+        return DetailedTiming(pixelClock10kHz: clock10kHz,
+                              hActive: width, hBlank: hBlank, hFront: hFront, hSync: hSync,
+                              vActive: height, vBlank: vBlank, vFront: vFront, vSync: vSync)
+    }
+
+    /// CVT encodes the aspect ratio in the vsync width.
+    static func cvtVSyncLines(width: Int, height: Int) -> Int {
+        let ratio = Double(width) / Double(height)
+        let table: [(Double, Int)] = [(4.0 / 3, 4), (16.0 / 9, 5), (16.0 / 10, 6), (5.0 / 4, 7), (15.0 / 9, 7)]
+        return table.first { abs($0.0 - ratio) < 0.01 }?.1 ?? 10
+    }
+}
+
+/// The monitor's own statement of what it can take, from the EDID's range
+/// limits descriptor. Anything inside these is a rate the manufacturer signed
+/// up for, even when they did not spell out a timing for it.
+struct RangeLimits: Equatable {
+    var minVHz: Int
+    var maxVHz: Int
+    var minHKHz: Int
+    var maxHKHz: Int
+    var maxPixelClockMHz: Int?
+}
+
+struct EDID: Equatable {
+    var bytes: [UInt8]
+
+    static let header: [UInt8] = [0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]
+    static let baseDescriptorOffsets = [54, 72, 90, 108]
+
+    init?(_ data: Data) {
+        let bytes = [UInt8](data)
+        guard bytes.count >= 128, bytes.count % 128 == 0, Array(bytes[0..<8]) == EDID.header else { return nil }
+        self.bytes = bytes
+    }
+
+    var blockCount: Int { bytes.count / 128 }
+
+    var preferredTiming: DetailedTiming? { DetailedTiming(Array(bytes[54..<72])) }
+
+    var rangeLimits: RangeLimits? {
+        for offset in EDID.baseDescriptorOffsets
+        where bytes[offset] == 0 && bytes[offset + 1] == 0 && bytes[offset + 3] == 0xFD {
+            let d = Array(bytes[offset..<offset + 18])
+            // Byte 4 adds 255 to a limit that would not fit in a byte.
+            let extra = { (bit: UInt8) in d[4] & bit != 0 ? 255 : 0 }
+            return RangeLimits(minVHz: Int(d[5]) + extra(0x01),
+                               maxVHz: Int(d[6]) + extra(0x02),
+                               minHKHz: Int(d[7]) + extra(0x04),
+                               maxHKHz: Int(d[8]) + extra(0x08),
+                               maxPixelClockMHz: d[9] == 0 ? nil : Int(d[9]) * 10)
+        }
+        return nil
+    }
+
+    /// Start offsets of every CEA-861 extension block.
+    var ceaBlocks: [Int] {
+        (1..<max(blockCount, 1)).map { $0 * 128 }.filter { bytes[$0] == 0x02 }
+    }
+
+    /// Offsets of the timing descriptors in a CEA block, and where the next
+    /// one would go.
+    func ceaTimingSlots(_ base: Int) -> (used: [Int], next: Int)? {
+        let start = Int(bytes[base + 2])
+        guard start >= 4 else { return nil }
+        var offset = base + start
+        var used: [Int] = []
+        while offset + 18 <= base + 127, bytes[offset] != 0 || bytes[offset + 1] != 0 {
+            used.append(offset)
+            offset += 18
+        }
+        return (used, offset)
+    }
+
+    var detailedTimings: [DetailedTiming] {
+        var offsets = EDID.baseDescriptorOffsets
+        for base in ceaBlocks {
+            offsets += ceaTimingSlots(base)?.used ?? []
+        }
+        return offsets.compactMap { DetailedTiming(Array(bytes[$0..<$0 + 18])) }.filter { !$0.isInterlaced }
+    }
+
+    /// An HDMI input states the fastest link it takes, which can be lower than
+    /// the range limits. Honouring it costs nothing over DisplayPort and keeps
+    /// an HDMI adapter in the chain from being overdriven.
+    var maxTMDSClockMHz: Int? {
+        var hdmi: Int?
+        var hdmiForum: Int?
+        for base in ceaBlocks {
+            let end = base + Int(bytes[base + 2])
+            var pos = base + 4
+            while pos < end {
+                let tag = bytes[pos] >> 5
+                let length = Int(bytes[pos] & 0x1F)
+                if tag == 3, length >= 3 {
+                    let oui = Int(bytes[pos + 1]) | Int(bytes[pos + 2]) << 8 | Int(bytes[pos + 3]) << 16
+                    if oui == 0x000C03, length >= 7, bytes[pos + 7] != 0 { hdmi = Int(bytes[pos + 7]) * 5 }
+                    if oui == 0xC45DD8, length >= 5, bytes[pos + 5] != 0 { hdmiForum = Int(bytes[pos + 5]) * 5 }
+                }
+                pos += 1 + length
+            }
+        }
+        return hdmiForum ?? hdmi
+    }
+
+    /// Whole-number rates this EDID spells out at a given pixel size.
+    func ratesAt(width: Int, height: Int) -> Set<Int> {
+        Set(detailedTimings.filter { $0.hActive == width && $0.vActive == height }
+            .map { RefreshRateInfo.label($0.refreshHz) })
+    }
+
+    /// The highest common rate the range limits allow at the native resolution
+    /// that is above everything macOS lists there. Every limit has to hold: the
+    /// vertical rate, the line rate, the pixel clock and any HDMI link cap.
+    func unlockCandidate(above listedHz: Int) -> (hz: Int, timing: DetailedTiming)? {
+        guard let native = preferredTiming, let limits = rangeLimits,
+              limits.maxVHz > 0, limits.maxHKHz > 0 else { return nil }
+        let clockCap = [limits.maxPixelClockMHz, maxTMDSClockMHz].compactMap { $0 }.min()
+
+        for hz in [240, 165, 144, 120, 100, 90, 85, 75, 72] where hz > listedHz && hz <= limits.maxVHz {
+            for version in [1, 2] {
+                guard var timing = DetailedTiming.reducedBlanking(width: native.hActive,
+                                                                  height: native.vActive,
+                                                                  hz: Double(hz),
+                                                                  version: version) else { continue }
+                guard timing.hFreqKHz <= Double(limits.maxHKHz) else { continue }
+                if let cap = clockCap, timing.pixelClockMHz > Double(cap) { continue }
+                timing.hImageMM = native.hImageMM
+                timing.vImageMM = native.vImageMM
+                return (hz, timing)
+            }
+        }
+        return nil
+    }
+
+    /// A copy with `timing` added, placed where it disturbs the least: a free
+    /// slot in a CEA block, else the CEA timing least worth keeping (one below
+    /// 60 Hz first, then the smallest), else an unused base descriptor, else a
+    /// new CEA block when there is none yet.
+    func adding(_ timing: DetailedTiming) -> EDID? {
+        var copy = self
+        let record = timing.bytes
+
+        for base in ceaBlocks {
+            guard let slots = ceaTimingSlots(base) else { continue }
+            let target: Int?
+            if slots.next + 18 <= base + 127 {
+                target = slots.next
+            } else {
+                target = slots.used.min { lhs, rhs in
+                    let a = DetailedTiming(Array(bytes[lhs..<lhs + 18]))
+                    let b = DetailedTiming(Array(bytes[rhs..<rhs + 18]))
+                    let aSlow = (a?.refreshHz ?? 0) < 59
+                    let bSlow = (b?.refreshHz ?? 0) < 59
+                    if aSlow != bSlow { return aSlow }
+                    return (a.map { $0.hActive * $0.vActive } ?? 0) < (b.map { $0.hActive * $0.vActive } ?? 0)
+                }
+            }
+            if let target = target {
+                copy.bytes.replaceSubrange(target..<target + 18, with: record)
+                copy.fixChecksum(base)
+                return copy
+            }
+        }
+
+        for offset in EDID.baseDescriptorOffsets.dropFirst()
+        where bytes[offset] == 0 && bytes[offset + 1] == 0 && bytes[offset + 3] == 0x10 {
+            copy.bytes.replaceSubrange(offset..<offset + 18, with: record)
+            copy.fixChecksum(0)
+            return copy
+        }
+
+        guard blockCount == 1 else { return nil }
+        var block: [UInt8] = [0x02, 0x03, 0x04, 0x00] + record
+        block += [UInt8](repeating: 0, count: 128 - block.count)
+        copy.bytes[126] = 1
+        copy.fixChecksum(0)
+        copy.bytes += block
+        copy.fixChecksum(128)
+        return copy
+    }
+
+    mutating func fixChecksum(_ base: Int) {
+        let sum = bytes[base..<base + 127].reduce(0) { ($0 + Int($1)) & 0xFF }
+        bytes[base + 127] = UInt8((256 - sum) & 0xFF)
+    }
+}
+
+/// What the app knows about one monitor's EDID: the one it sends, and the one
+/// a display override makes macOS use instead.
+struct DisplayEDIDInfo {
+    var vendor: UInt32
+    var product: UInt32
+    var hardware: EDID
+    var override: EDID?
+    var overrideDictionary: [String: Any]?
+
+    var effective: EDID { override ?? hardware }
+}
+
+/// Display overrides are how an Intel Mac is told to use a different EDID:
+/// a property list per vendor and product, read when the display connects.
+/// Apple Silicon ignores the EDID in them, and has no IODisplayConnect to
+/// read the original from, so there the unlock rows simply never appear.
+enum DisplayOverride {
+    static let root = "/Library/Displays/Contents/Resources/Overrides"
+
+    static func directory(vendor: UInt32) -> String {
+        "\(root)/DisplayVendorID-\(String(vendor, radix: 16))"
+    }
+
+    static func path(vendor: UInt32, product: UInt32) -> String {
+        "\(directory(vendor: vendor))/DisplayProductID-\(String(product, radix: 16))"
+    }
+
+    static func read(vendor: UInt32, product: UInt32) -> [String: Any]? {
+        guard let data = FileManager.default.contents(atPath: path(vendor: vendor, product: product)) else { return nil }
+        return (try? PropertyListSerialization.propertyList(from: data, format: nil)) as? [String: Any]
+    }
+
+    /// The first time an override is touched, whatever was there is copied
+    /// aside, so a hand-made one can always be put back.
+    static func backUp(vendor: UInt32, product: UInt32) {
+        let fm = FileManager.default
+        let source = path(vendor: vendor, product: product)
+        guard fm.fileExists(atPath: source),
+              let support = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return }
+        let folder = support.appendingPathComponent("AutoDisplayToggle/OverrideBackups", isDirectory: true)
+        let backup = folder.appendingPathComponent("DisplayVendorID-\(String(vendor, radix: 16))-DisplayProductID-\(String(product, radix: 16)).plist")
+        guard !fm.fileExists(atPath: backup.path) else { return }
+        try? fm.createDirectory(at: folder, withIntermediateDirectories: true)
+        try? fm.copyItem(atPath: source, toPath: backup.path)
+    }
+
+    enum Failure: Error {
+        case cancelled
+        case failed(String)
+    }
+
+    /// Writes `dictionary`, or deletes the override when it is nil. The folder
+    /// belongs to root, so unless the file is already writable this goes
+    /// through macOS's own administrator prompt.
+    static func write(_ dictionary: [String: Any]?, vendor: UInt32, product: UInt32) throws {
+        let fm = FileManager.default
+        let file = path(vendor: vendor, product: product)
+        let folder = directory(vendor: vendor)
+
+        guard let dictionary = dictionary else {
+            if !fm.fileExists(atPath: file) { return }
+            if fm.isWritableFile(atPath: folder), (try? fm.removeItem(atPath: file)) != nil { return }
+            try runPrivileged("rm -f \(shellQuoted(file))")
+            return
+        }
+
+        let data: Data
+        do {
+            data = try PropertyListSerialization.data(fromPropertyList: dictionary, format: .xml, options: 0)
+        } catch {
+            throw Failure.failed(error.localizedDescription)
+        }
+
+        // In place rather than atomically: an atomic write needs the folder,
+        // and only the file may be ours.
+        if fm.isWritableFile(atPath: file), (try? data.write(to: URL(fileURLWithPath: file))) != nil { return }
+        if fm.isWritableFile(atPath: folder), (try? data.write(to: URL(fileURLWithPath: file), options: .atomic)) != nil { return }
+
+        let staged = fm.temporaryDirectory.appendingPathComponent("AutoDisplayToggle-override-\(UUID().uuidString).plist")
+        do {
+            try data.write(to: staged)
+        } catch {
+            throw Failure.failed(error.localizedDescription)
+        }
+        defer { try? fm.removeItem(at: staged) }
+        try runPrivileged("mkdir -p \(shellQuoted(folder)) && cp \(shellQuoted(staged.path)) \(shellQuoted(file)) && chmod 644 \(shellQuoted(file))")
+    }
+
+    static func shellQuoted(_ text: String) -> String {
+        "'" + text.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    static func runPrivileged(_ command: String) throws {
+        let escaped = command
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        let source = "do shell script \"\(escaped)\" with prompt \"AutoDisplayToggle wants to update a display override.\" with administrator privileges"
+        var error: NSDictionary?
+        guard let script = NSAppleScript(source: source) else { throw Failure.failed("Could not prepare the request.") }
+        script.executeAndReturnError(&error)
+        guard let error = error else { return }
+        if (error[NSAppleScript.errorNumber] as? Int) == -128 { throw Failure.cancelled }
+        throw Failure.failed(error[NSAppleScript.errorMessage] as? String ?? "Unknown error")
+    }
+}
+
 /// Why switching is off for now. A pause is an off that ends by itself, so it
 /// lives beside the master switch rather than inside it.
 enum PauseMode: Equatable {
@@ -512,6 +965,8 @@ struct MenuState: Equatable {
     /// Whole minutes left on a timed pause. It belongs in the state so the
     /// countdown actually re-renders while the menu sits open.
     var pauseMinutesRemaining: Int?
+    var refreshRates: [RefreshRateInfo]
+    var preferHighestRefreshRate: Bool
 
     var internalDisplay: DisplayInfo? { displays.first { $0.isBuiltin } }
     var internalDisplayPresent: Bool { internalDisplay != nil }
@@ -669,6 +1124,50 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var pausedExternalCount = 0
     var pauseTimer: Timer?
 
+    // Refresh rate section: a pool like the display rows, filled with one
+    // header per external display followed by its rates.
+    let maxRefreshRateRows = 16
+    var refreshRateRows: [MenuRowView] = []
+    var refreshRateRowItems: [NSMenuItem] = []
+    var refreshRateSeparatorItem: NSMenuItem!
+    var highestRateRow: MenuRowView!
+    var highestRateItem: NSMenuItem!
+
+    var preferHighestRefreshRate = false {
+        didSet {
+            guard preferHighestRefreshRate != oldValue else { return }
+            UserDefaults.standard.set(preferHighestRefreshRate, forKey: Preference.preferHighestRefreshRate)
+        }
+    }
+    // While the keep-or-revert dialog is up, nothing else may touch modes.
+    var isConfirmingRefreshRate = false
+    var refreshRateWorkItem: DispatchWorkItem?
+    // A display that will not hold a rate would otherwise be retried on every
+    // reconfiguration it causes, flickering forever.
+    var lastAutoRefreshAttempt: [CGDirectDisplayID: Date] = [:]
+    let autoRefreshRetryInterval: TimeInterval = 30
+    // An untested rate is offered once per launch; ignoring the dialog is not
+    // an answer, so it is not remembered as one.
+    var autoTrialsOffered: Set<String> = []
+    var trustedRefreshRates: Set<String> = [] {
+        didSet { UserDefaults.standard.set(Array(trustedRefreshRates), forKey: Preference.trustedRefreshRates) }
+    }
+    var rejectedRefreshRates: Set<String> = [] {
+        didSet { UserDefaults.standard.set(Array(rejectedRefreshRates), forKey: Preference.rejectedRefreshRates) }
+    }
+    // Reading the EDID walks the IORegistry, too slow for a once-a-second
+    // menu refresh. Dropped whenever the displays change.
+    var edidCache: [CGDirectDisplayID: DisplayEDIDInfo?] = [:]
+
+    // A monitor can spend well over ten seconds hunting for its input after a
+    // mode change, and macOS may not notice any of it. The countdown therefore
+    // only starts once the display has stopped changing, restarts if it changes
+    // again, and is long enough to outlast a hunt macOS never saw.
+    let refreshRateSettleSeconds: TimeInterval = 3
+    let refreshRateMaxSettleWait: TimeInterval = 20
+    let refreshRateConfirmSeconds: TimeInterval = 45
+    let refreshRateDialogLimit: TimeInterval = 120
+
     func applicationDidFinishLaunching(_ aNotification: Notification) {
         loadPreferences()
         resolveInternalDisplay()
@@ -680,6 +1179,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         setupGlobalShortcuts() // میانبرهای سراسری
         setupTerminationHandlers()
         startMonitoring()
+        scheduleRefreshRateEnforcement(after: 2.0)
         // پیام خوش‌آمد بعد از تعیین‌تکلیف مجوز نوتیفیکیشن فرستاده می‌شود
         // تا اولین نوتیفیکیشن هم با آیکن خود برنامه نمایش داده شود.
         setupNotifications {
@@ -750,6 +1250,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(item)
         }
 
+        refreshRateSeparatorItem = NSMenuItem.separator()
+        menu.addItem(refreshRateSeparatorItem)
+
+        for _ in 0..<maxRefreshRateRows {
+            let row = MenuRowView(style: .single)
+            let item = rowItem(row, accessibilityTitle: "Refresh rate")
+            item.isHidden = true
+            refreshRateRows.append(row)
+            refreshRateRowItems.append(item)
+            menu.addItem(item)
+        }
+
+        highestRateRow = MenuRowView(style: .single)
+        highestRateRow.onClick = { [weak self] in self?.toggleHighestRefreshRate() }
+        highestRateItem = rowItem(highestRateRow, accessibilityTitle: "Always use highest refresh rate")
+        menu.addItem(highestRateItem)
+
         menu.addItem(NSMenuItem.separator())
 
         notificationsRow = MenuRowView(style: .single)
@@ -792,8 +1309,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(quitItem)
 
         statusItem.menu = menu
-        menuRows = [statusRow, switchingRow, brightnessRow, pauseHourRow, pauseUntilChangeRow,
-                    resumeRow, notificationsRow, loginRow, panicRow, quitRow] + displayRows
+        let fixedRows: [MenuRowView] = [statusRow, switchingRow, brightnessRow, pauseHourRow,
+                                        pauseUntilChangeRow, resumeRow, notificationsRow, loginRow,
+                                        panicRow, quitRow, highestRateRow]
+        menuRows = fixedRows + displayRows + refreshRateRows
         refreshMenu()
     }
 
@@ -822,14 +1341,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func currentMenuState() -> MenuState {
-        MenuState(isEnabled: isEnabled,
-                  displays: surveyDisplays(),
-                  loginItem: currentLoginItemState(),
-                  hotKeysRegistered: hotKeysRegistered,
-                  notificationsEnabled: notificationsEnabled,
-                  restoreBrightness: savedBrightness,
-                  pauseMode: pauseMode,
-                  pauseMinutesRemaining: pauseMinutesRemaining)
+        let displays = surveyDisplays()
+        return MenuState(isEnabled: isEnabled,
+                         displays: displays,
+                         loginItem: currentLoginItemState(),
+                         hotKeysRegistered: hotKeysRegistered,
+                         notificationsEnabled: notificationsEnabled,
+                         restoreBrightness: savedBrightness,
+                         pauseMode: pauseMode,
+                         pauseMinutesRemaining: pauseMinutesRemaining,
+                         refreshRates: surveyRefreshRates(displays),
+                         preferHighestRefreshRate: preferHighestRefreshRate)
     }
 
     /// Rounded up, so a pause with thirty seconds left still reads as a minute.
@@ -884,6 +1406,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let stored = defaults.float(forKey: Preference.restoreBrightness)
         if stored > 0.01 { savedBrightness = stored }
+        preferHighestRefreshRate = defaults.bool(forKey: Preference.preferHighestRefreshRate)
+        trustedRefreshRates = Set(defaults.stringArray(forKey: Preference.trustedRefreshRates) ?? [])
+        rejectedRefreshRates = Set(defaults.stringArray(forKey: Preference.rejectedRefreshRates) ?? [])
     }
 
     func render(_ state: MenuState) {
@@ -914,6 +1439,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                                            hint: state.pauseHint)
 
         renderDisplayRows(state)
+        renderRefreshRateRows(state)
 
         notificationsRow.content = MenuRowContent(symbolNames: [state.notificationsEnabled ? "bell" : "bell.slash"],
                                                   title: "Notifications",
@@ -953,6 +1479,89 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 item.isHidden = true
             }
         }
+    }
+
+    /// Per external display: a header with the current rate, a row per rate it
+    /// offers at this resolution, then whatever its EDID makes possible beyond
+    /// that. A display with one rate and nothing to unlock gets the header only.
+    func renderRefreshRateRows(_ state: MenuState) {
+        let hasExternal = !state.refreshRates.isEmpty
+        refreshRateSeparatorItem.isHidden = !hasExternal
+        highestRateItem.isHidden = !hasExternal
+
+        highestRateRow.content = MenuRowContent(symbolNames: ["arrow.up.to.line.compact", "arrow.up.to.line"],
+                                                title: "Always use highest rate",
+                                                accessory: .toggle(isOn: state.preferHighestRefreshRate))
+
+        // Each entry is the content of one pooled row plus what a click does.
+        var entries: [(MenuRowContent, (() -> Void)?)] = []
+        let showNames = state.refreshRates.count > 1
+
+        for info in state.refreshRates {
+            let displayID = info.displayID
+            let name = info.name
+            entries.append((MenuRowContent(symbolNames: ["speedometer", "gauge"],
+                                           title: "Refresh rate",
+                                           hint: showNames ? info.name : nil,
+                                           accessory: .detail("\(info.currentLabel) Hz"),
+                                           isInteractive: false), nil))
+
+            if info.availableHz.count > 1 {
+                for hz in info.availableHz {
+                    let label = RefreshRateInfo.label(hz)
+                    let isCurrent = label == info.currentLabel
+                    entries.append((MenuRowContent(symbolNames: isCurrent ? ["checkmark"] : [],
+                                                   title: "\(label) Hz",
+                                                   hint: refreshRateHint(label, info),
+                                                   isInteractive: !isCurrent),
+                                    { [weak self] in self?.chooseRefreshRate(hz, displayID: displayID, name: name) }))
+                }
+            }
+
+            for hz in info.pendingHz {
+                entries.append((MenuRowContent(symbolNames: ["cable.connector", "arrow.triangle.2.circlepath"],
+                                               title: "\(hz) Hz unlocked",
+                                               hint: "reconnect display",
+                                               isInteractive: false), nil))
+            }
+
+            if let hz = info.unlockCandidateHz {
+                entries.append((MenuRowContent(symbolNames: ["lock.open"],
+                                               title: "Unlock \(hz) Hz…",
+                                               hint: info.nativeSizeLabel),
+                                { [weak self] in self?.unlockRefreshRate(displayID: displayID, name: name) }))
+            }
+
+            if !info.unlockedHz.isEmpty {
+                entries.append((MenuRowContent(symbolNames: ["lock"],
+                                               title: "Remove unlocked rates…"),
+                                { [weak self] in self?.removeUnlockedRates(displayID: displayID, name: name) }))
+            }
+        }
+
+        for (index, row) in refreshRateRows.enumerated() {
+            let item = refreshRateRowItems[index]
+            guard index < entries.count else {
+                item.isHidden = true
+                row.onClick = nil
+                continue
+            }
+            let (content, action) = entries[index]
+            item.isHidden = false
+            // Rows that only report are skipped by the arrow keys.
+            item.isEnabled = content.isInteractive
+            row.content = content
+            row.onClick = action
+        }
+    }
+
+    /// One word on why a rate is special, most important first.
+    func refreshRateHint(_ hz: Int, _ info: RefreshRateInfo) -> String? {
+        if info.rejectedHz.contains(hz) { return "auto skips" }
+        if info.needsTrial(hz) { return "untested" }
+        if info.isNativeResolution && info.unlockedHz.contains(hz) { return "unlocked" }
+        if let highest = info.highestHz, RefreshRateInfo.label(highest) == hz { return "highest" }
+        return nil
     }
 
     func renderStatusButton(_ state: MenuState) {
@@ -1179,6 +1788,476 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func setRestoreBrightness(_ value: Float) {
         savedBrightness = min(max(value, 0.05), 1.0)
         refreshMenu()
+    }
+
+    // ---------- Refresh rate ----------
+
+    func allDisplayModes(for id: CGDirectDisplayID) -> [CGDisplayMode] {
+        // Without the duplicates the HiDPI variants never show up at all.
+        let options = [kCGDisplayShowDuplicateLowResolutionModes: kCFBooleanTrue] as CFDictionary
+        return (CGDisplayCopyAllDisplayModes(id, options) as? [CGDisplayMode]) ?? []
+    }
+
+    /// The modes that differ from `current` only in refresh rate, highest
+    /// first, one per whole-number rate. Both the point and the pixel size have
+    /// to match, or picking a rate would also flip a HiDPI mode to low
+    /// resolution.
+    func refreshModes(_ all: [CGDisplayMode], matching current: CGDisplayMode) -> [CGDisplayMode] {
+        var byLabel: [Int: CGDisplayMode] = [:]
+        for mode in all where mode.refreshRate > 0
+            && mode.isUsableForDesktopGUI()
+            && mode.width == current.width && mode.height == current.height
+            && mode.pixelWidth == current.pixelWidth && mode.pixelHeight == current.pixelHeight {
+            let label = RefreshRateInfo.label(mode.refreshRate)
+            // The current mode wins its own slot, so re-picking it is a no-op.
+            if byLabel[label] == nil || mode.ioDisplayModeID == current.ioDisplayModeID {
+                byLabel[label] = mode
+            }
+        }
+        return byLabel.values.sorted { $0.refreshRate > $1.refreshRate }
+    }
+
+    /// Vendor, product and serial: what tells one monitor from another across
+    /// replugs, desks and display ID reshuffles.
+    func displayKey(_ id: CGDirectDisplayID) -> String {
+        "\(String(CGDisplayVendorNumber(id), radix: 16))-\(String(CGDisplayModelNumber(id), radix: 16))-\(CGDisplaySerialNumber(id))"
+    }
+
+    func edidInfo(for id: CGDirectDisplayID) -> DisplayEDIDInfo? {
+        if let cached = edidCache[id] { return cached }
+        let info = readEDIDInfo(for: id)
+        // updateValue, because assigning nil through the subscript would drop
+        // the entry instead of remembering that there is no EDID to read.
+        edidCache.updateValue(info, forKey: id)
+        return info
+    }
+
+    /// The EDID the monitor sends, found through IODisplayConnect by vendor,
+    /// product and serial, plus the one its display override substitutes.
+    /// macOS keeps reporting the monitor's own EDID while an override is in
+    /// force, so the override has to be read from its file.
+    func readEDIDInfo(for id: CGDirectDisplayID) -> DisplayEDIDInfo? {
+        let vendor = CGDisplayVendorNumber(id)
+        let product = CGDisplayModelNumber(id)
+        let serial = CGDisplaySerialNumber(id)
+
+        var iterator: io_iterator_t = 0
+        guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IODisplayConnect"), &iterator) == KERN_SUCCESS else {
+            return nil
+        }
+        defer { IOObjectRelease(iterator) }
+
+        var hardware: EDID?
+        while case let service = IOIteratorNext(iterator), service != 0 {
+            defer { IOObjectRelease(service) }
+            guard hardware == nil else { continue }
+            let info = IODisplayCreateInfoDictionary(service, IOOptionBits(kIODisplayOnlyPreferredName))
+                .takeRetainedValue() as NSDictionary
+            guard (info["DisplayVendorID"] as? NSNumber)?.uint32Value == vendor,
+                  (info["DisplayProductID"] as? NSNumber)?.uint32Value == product else { continue }
+            if serial != 0, let other = (info["DisplaySerialNumber"] as? NSNumber)?.uint32Value,
+               other != 0, other != serial {
+                continue
+            }
+            let data = (info["IODisplayEDIDOriginal"] as? Data) ?? (info["IODisplayEDID"] as? Data)
+            hardware = data.flatMap { EDID($0) }
+        }
+        guard let hardware = hardware else { return nil }
+
+        let dictionary = DisplayOverride.read(vendor: vendor, product: product)
+        let override = (dictionary?["IODisplayEDID"] as? Data).flatMap { EDID($0) }
+        return DisplayEDIDInfo(vendor: vendor,
+                               product: product,
+                               hardware: hardware,
+                               override: override == hardware ? nil : override,
+                               overrideDictionary: dictionary)
+    }
+
+    func surveyRefreshRates(_ displays: [DisplayInfo]) -> [RefreshRateInfo] {
+        displays.filter { !$0.isBuiltin && $0.isActive }.compactMap { display in
+            guard let current = CGDisplayCopyDisplayMode(display.id), current.refreshRate > 0 else { return nil }
+            let all = allDisplayModes(for: display.id)
+            let rates = refreshModes(all, matching: current).map { $0.refreshRate }
+            let available = rates.isEmpty ? [current.refreshRate] : rates
+
+            var info = RefreshRateInfo(displayID: display.id,
+                                       name: display.name,
+                                       currentHz: current.refreshRate,
+                                       availableHz: available,
+                                       verdictKeyPrefix: "\(displayKey(display.id))|\(current.pixelWidth)x\(current.pixelHeight)",
+                                       isNativeResolution: false,
+                                       nativeSizeLabel: nil,
+                                       unlockCandidateHz: nil,
+                                       unlockedHz: [],
+                                       pendingHz: [],
+                                       trustedHz: [],
+                                       rejectedHz: [])
+            let labels = available.map(RefreshRateInfo.label)
+            info.trustedHz = Set(labels.filter { trustedRefreshRates.contains(info.verdictKey($0)) })
+            info.rejectedHz = Set(labels.filter { rejectedRefreshRates.contains(info.verdictKey($0)) })
+
+            guard let edid = edidInfo(for: display.id), let native = edid.hardware.preferredTiming else { return info }
+            let width = native.hActive
+            let height = native.vActive
+            info.nativeSizeLabel = "\(width)×\(height)"
+            info.isNativeResolution = current.pixelWidth == width && current.pixelHeight == height
+
+            // What macOS offers at the native size, at any HiDPI scale.
+            let listedNative = Set(all.filter { $0.pixelWidth == width && $0.pixelHeight == height && $0.refreshRate > 0 }
+                .map { RefreshRateInfo.label($0.refreshRate) })
+            let hardwareRates = edid.hardware.ratesAt(width: width, height: height)
+            let effectiveRates = edid.effective.ratesAt(width: width, height: height)
+
+            info.unlockedHz = effectiveRates.subtracting(hardwareRates).sorted(by: >)
+            info.pendingHz = info.unlockedHz.filter { !listedNative.contains($0) }
+            let ceiling = max(listedNative.max() ?? 0, effectiveRates.max() ?? 0)
+            info.unlockCandidateHz = edid.effective.unlockCandidate(above: ceiling)?.hz
+            return info
+        }
+    }
+
+    func refreshRateInfo(_ id: CGDirectDisplayID) -> RefreshRateInfo? {
+        surveyRefreshRates(surveyDisplays()).first { $0.displayID == id }
+    }
+
+    @discardableResult
+    func applyDisplayMode(_ mode: CGDisplayMode, to id: CGDirectDisplayID, option: CGConfigureOption) -> Bool {
+        var config: CGDisplayConfigRef?
+        guard CGBeginDisplayConfiguration(&config) == .success else { return false }
+        guard CGConfigureDisplayWithDisplayMode(config, id, mode, nil) == .success else {
+            CGCancelDisplayConfiguration(config)
+            return false
+        }
+        return CGCompleteDisplayConfiguration(config, option) == .success
+    }
+
+    /// The mode for `hz` at the display's current size, looked up fresh: a mode
+    /// object from an earlier survey may belong to a display ID that is gone.
+    func refreshMode(_ hz: Double, on id: CGDirectDisplayID) -> (current: CGDisplayMode, target: CGDisplayMode)? {
+        guard let current = CGDisplayCopyDisplayMode(id) else { return nil }
+        let label = RefreshRateInfo.label(hz)
+        guard let target = refreshModes(allDisplayModes(for: id), matching: current)
+            .first(where: { RefreshRateInfo.label($0.refreshRate) == label }) else { return nil }
+        return (current, target)
+    }
+
+    /// A rate row was clicked. Picking anything below what "Always use highest
+    /// rate" would choose says the user does not want that forced back on.
+    func chooseRefreshRate(_ hz: Double, displayID: CGDirectDisplayID, name: String) {
+        // A row with a view has to dismiss the menu itself, and the dialog
+        // that follows cannot run inside the menu's tracking loop.
+        statusItem.menu?.cancelTracking()
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            if self.preferHighestRefreshRate,
+               let target = self.refreshRateInfo(displayID)?.autoTargetHz,
+               RefreshRateInfo.label(hz) < target {
+                self.preferHighestRefreshRate = false
+                self.sendNotification(title: "Highest Rate Off",
+                                      message: "⏹️ A lower rate was picked by hand, so it is no longer forced.")
+            }
+            self.tryRefreshRate(hz, displayID: displayID, name: name)
+        }
+    }
+
+    /// Switches, asks whether the picture is fine, and either keeps it or puts
+    /// the old mode back. The answer is remembered for this monitor: a kept
+    /// rate is trusted for silent switching, a reverted one is never chosen
+    /// automatically again. Letting the dialog run out is not an answer.
+    @discardableResult
+    func tryRefreshRate(_ hz: Double, displayID: CGDirectDisplayID, name: String) -> Bool {
+        guard !isConfirmingRefreshRate else { return false }
+        guard let (previous, target) = refreshMode(hz, on: displayID) else {
+            sendNotification(title: "Refresh Rate Unavailable",
+                             message: "⚠️ \(name) no longer offers \(RefreshRateInfo.label(hz)) Hz at this resolution.",
+                             isWarning: true)
+            refreshMenu()
+            return false
+        }
+        guard target.ioDisplayModeID != previous.ioDisplayModeID else { return true }
+
+        let label = RefreshRateInfo.label(target.refreshRate)
+        let verdictKey = refreshRateInfo(displayID)?.verdictKey(label)
+
+        isConfirmingRefreshRate = true
+        defer {
+            isConfirmingRefreshRate = false
+            refreshMenu()
+        }
+
+        // Written to the display preferences straight away. Making it stick
+        // only after Keep would mean a second mode set, and with it a second
+        // round of input hunting on the monitors that do that.
+        guard applyDisplayMode(target, to: displayID, option: .permanently) else {
+            sendNotification(title: "Refresh Rate Failed",
+                             message: "⚠️ Could not switch \(name) to \(label) Hz.",
+                             isWarning: true)
+            return false
+        }
+
+        switch confirmRefreshRate(label: label, name: name, displayID: displayID, targetModeID: target.ioDisplayModeID) {
+        case .keep:
+            if let key = verdictKey {
+                trustedRefreshRates.insert(key)
+                rejectedRefreshRates.remove(key)
+            }
+            sendNotification(title: "Refresh Rate", message: "⚡️ \(name) is now running at \(label) Hz.")
+            return true
+        case .revert:
+            if let key = verdictKey {
+                rejectedRefreshRates.insert(key)
+                trustedRefreshRates.remove(key)
+            }
+        case .timedOut:
+            break
+        }
+
+        applyDisplayMode(previous, to: displayID, option: .permanently)
+        sendNotification(title: "Refresh Rate Reverted",
+                         message: "↩️ \(name) is back at \(RefreshRateInfo.label(previous.refreshRate)) Hz.")
+        return false
+    }
+
+    func displaySnapshot(_ id: CGDirectDisplayID) -> DisplaySnapshot {
+        DisplaySnapshot(isOnline: CGDisplayIsOnline(id) != 0,
+                        isActive: CGDisplayIsActive(id) != 0,
+                        modeID: CGDisplayCopyDisplayMode(id)?.ioDisplayModeID ?? 0,
+                        bounds: CGDisplayBounds(id))
+    }
+
+    /// A Keep / Revert alert whose countdown waits for the display. It starts
+    /// once the display has shown the new mode, unchanged, for a few seconds
+    /// (or after a cap, for a monitor that hunts without macOS noticing),
+    /// starts over whenever the display changes again, and picks Revert by
+    /// itself when it runs out. The timer runs in the modal mode, since
+    /// runModal spins the run loop in nothing else.
+    func confirmRefreshRate(label: Int, name: String, displayID: CGDirectDisplayID, targetModeID: Int32) -> RefreshRateAnswer {
+        let alert = NSAlert()
+        alert.messageText = "Keep \(label) Hz on \(name)?"
+        alert.addButton(withTitle: "Keep")
+        alert.addButton(withTitle: "Revert").keyEquivalent = "\u{1b}"
+
+        // The longest text goes in first: an alert sizes itself when shown.
+        let waitingText = "Waiting for \(name) to settle. Some monitors search their inputs for a while after a rate change, so the countdown only starts once the picture is back."
+        let countdownText = { (seconds: Int) in
+            "The previous rate comes back in \(seconds) second\(seconds == 1 ? "" : "s") unless you keep this one."
+        }
+        alert.informativeText = waitingText
+
+        let start = Date()
+        var waitingSince = start
+        var lastChange = start
+        var snapshot = displaySnapshot(displayID)
+        var deadline: Date?
+
+        let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] timer in
+            guard let self = self else { return }
+            let now = Date()
+            let latest = self.displaySnapshot(displayID)
+            if latest != snapshot {
+                snapshot = latest
+                lastChange = now
+                if deadline != nil {
+                    deadline = nil
+                    waitingSince = now
+                }
+            }
+
+            if deadline == nil {
+                let settled = now.timeIntervalSince(lastChange) >= self.refreshRateSettleSeconds
+                    && latest.isOnline && latest.isActive && latest.modeID == targetModeID
+                if settled || now.timeIntervalSince(waitingSince) >= self.refreshRateMaxSettleWait {
+                    deadline = now.addingTimeInterval(self.refreshRateConfirmSeconds)
+                }
+            }
+
+            let remaining = deadline.map { Int($0.timeIntervalSince(now).rounded(.up)) }
+            // A display that keeps flapping never settles; the hard limit is
+            // what stops the dialog from waiting forever in front of a black
+            // screen.
+            if (remaining ?? 1) <= 0 || now.timeIntervalSince(start) >= self.refreshRateDialogLimit {
+                timer.invalidate()
+                NSApp.abortModal()
+                return
+            }
+            alert.informativeText = remaining.map(countdownText) ?? waitingText
+        }
+        RunLoop.main.add(timer, forMode: .modalPanel)
+
+        // A menu bar app is never frontmost on its own, and an alert behind
+        // other windows would quietly revert.
+        NSApp.activate(ignoringOtherApps: true)
+        let response = alert.runModal()
+        timer.invalidate()
+
+        switch response {
+        case .alertFirstButtonReturn: return .keep
+        case .alertSecondButtonReturn: return .revert
+        default: return .timedOut
+        }
+    }
+
+    func toggleHighestRefreshRate() {
+        statusItem.menu?.cancelTracking()
+        preferHighestRefreshRate.toggle()
+        refreshMenu()
+        guard preferHighestRefreshRate else { return }
+        // Switching it on is the moment the user is watching, so every change
+        // it makes right now goes through the keep-or-revert check.
+        DispatchQueue.main.async { [weak self] in
+            self?.enforceHighestRefreshRates(interactive: true)
+        }
+    }
+
+    /// Debounced, like the reconcile: a replug or a wake fires a burst of
+    /// screen-parameter changes and only the settled state matters.
+    func scheduleRefreshRateEnforcement(after delay: TimeInterval) {
+        refreshRateWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in self?.enforceHighestRefreshRates() }
+        refreshRateWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
+    }
+
+    /// Puts every external display on the best rate it offers that the user
+    /// has not turned down, whatever monitor it is. A rate the monitor lists
+    /// itself, or one the user has kept before, is switched to quietly. One
+    /// that only exists because of an unlock is offered once per launch with
+    /// the keep-or-revert check. Runs whether or not automatic switching is on:
+    /// the refresh rate is a separate matter from the built-in panel.
+    func enforceHighestRefreshRates(interactive: Bool = false) {
+        guard preferHighestRefreshRate, !isSleeping, !isConfirmingRefreshRate else { return }
+
+        for info in surveyRefreshRates(surveyDisplays()) {
+            guard let target = info.autoTargetHz, target > info.currentLabel else { continue }
+
+            if interactive || info.needsTrial(target) {
+                let key = info.verdictKey(target)
+                if !interactive {
+                    guard !autoTrialsOffered.contains(key) else { continue }
+                    autoTrialsOffered.insert(key)
+                }
+                tryRefreshRate(Double(target), displayID: info.displayID, name: info.name)
+                continue
+            }
+
+            if let last = lastAutoRefreshAttempt[info.displayID],
+               Date().timeIntervalSince(last) < autoRefreshRetryInterval {
+                continue
+            }
+            lastAutoRefreshAttempt[info.displayID] = Date()
+
+            guard let (_, mode) = refreshMode(Double(target), on: info.displayID),
+                  applyDisplayMode(mode, to: info.displayID, option: .permanently) else {
+                sendNotification(title: "Refresh Rate Failed",
+                                 message: "⚠️ Could not switch \(info.name) to \(target) Hz.",
+                                 isWarning: true)
+                continue
+            }
+            sendNotification(title: "Refresh Rate", message: "⚡️ \(info.name) set to \(target) Hz.")
+        }
+        refreshMenu()
+    }
+
+    // ---------- Unlocking rates ----------
+
+    /// Adds the highest rate the monitor's own range limits allow at its native
+    /// resolution to its display override, after saying exactly what will be
+    /// written. Nothing switches here: macOS reads the override on the next
+    /// connect, and the first switch to the new rate is a checked one.
+    func unlockRefreshRate(displayID: CGDirectDisplayID, name: String) {
+        statusItem.menu?.cancelTracking()
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.edidCache.removeValue(forKey: displayID)
+
+            guard let edid = self.edidInfo(for: displayID),
+                  let native = edid.hardware.preferredTiming,
+                  let limits = edid.effective.rangeLimits,
+                  let hz = self.refreshRateInfo(displayID)?.unlockCandidateHz,
+                  let candidate = edid.effective.unlockCandidate(above: hz - 1),
+                  let patched = edid.effective.adding(candidate.timing) else {
+                self.sendNotification(title: "Unlock Unavailable",
+                                      message: "⚠️ \(name) has no rate left to unlock.",
+                                      isWarning: true)
+                self.refreshMenu()
+                return
+            }
+
+            let timing = candidate.timing
+            let alert = NSAlert()
+            alert.messageText = "Unlock \(candidate.hz) Hz on \(name)?"
+            alert.informativeText = """
+                \(name) accepts up to \(limits.maxVHz) Hz and \(limits.maxHKHz) kHz by its own EDID, \
+                but does not list \(candidate.hz) Hz at \(native.hActive)×\(native.vActive). This adds a \
+                \(String(format: "%.2f", timing.refreshHz)) Hz timing (\(String(format: "%.2f", timing.pixelClockMHz)) MHz) \
+                to its display override in /Library/Displays. macOS may ask for an administrator password.
+
+                Reconnect the display or restart to use it. The first switch to \(candidate.hz) Hz asks you to keep or revert it.
+                """
+            alert.addButton(withTitle: "Unlock")
+            alert.addButton(withTitle: "Cancel")
+            NSApp.activate(ignoringOtherApps: true)
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+            var dictionary = edid.overrideDictionary ?? [:]
+            if dictionary["DisplayVendorID"] == nil { dictionary["DisplayVendorID"] = Int(edid.vendor) }
+            if dictionary["DisplayProductID"] == nil { dictionary["DisplayProductID"] = Int(edid.product) }
+            dictionary["IODisplayEDID"] = Data(patched.bytes)
+
+            guard self.writeOverride(dictionary, edid: edid, name: name) else { return }
+            self.sendNotification(title: "\(candidate.hz) Hz Unlocked",
+                                  message: "🔓 Reconnect \(name) or restart to use it.")
+        }
+    }
+
+    /// Takes the EDID back out of the override and leaves the rest of it, such
+    /// as HiDPI scale lists, alone.
+    func removeUnlockedRates(displayID: CGDirectDisplayID, name: String) {
+        statusItem.menu?.cancelTracking()
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.edidCache.removeValue(forKey: displayID)
+            guard let edid = self.edidInfo(for: displayID), var dictionary = edid.overrideDictionary else {
+                self.refreshMenu()
+                return
+            }
+
+            let alert = NSAlert()
+            alert.messageText = "Remove unlocked rates on \(name)?"
+            alert.informativeText = "macOS goes back to the EDID \(name) sends itself. The rest of its display override stays. Reconnect the display or restart for it to take effect."
+            alert.addButton(withTitle: "Remove")
+            alert.addButton(withTitle: "Cancel")
+            NSApp.activate(ignoringOtherApps: true)
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+            dictionary.removeValue(forKey: "IODisplayEDID")
+            let leftover = Set(dictionary.keys).subtracting(["DisplayVendorID", "DisplayProductID", "DisplayProductName"])
+            guard self.writeOverride(leftover.isEmpty ? nil : dictionary, edid: edid, name: name) else { return }
+            self.sendNotification(title: "Unlocked Rates Removed",
+                                  message: "🔒 Reconnect \(name) or restart to finish.")
+        }
+    }
+
+    func writeOverride(_ dictionary: [String: Any]?, edid: DisplayEDIDInfo, name: String) -> Bool {
+        defer {
+            edidCache.removeAll()
+            refreshMenu()
+        }
+        DisplayOverride.backUp(vendor: edid.vendor, product: edid.product)
+        do {
+            try DisplayOverride.write(dictionary, vendor: edid.vendor, product: edid.product)
+            return true
+        } catch DisplayOverride.Failure.cancelled {
+            return false
+        } catch DisplayOverride.Failure.failed(let message) {
+            sendNotification(title: "Display Override Failed", message: "⚠️ \(name): \(message)", isWarning: true)
+            return false
+        } catch {
+            sendNotification(title: "Display Override Failed",
+                             message: "⚠️ \(name): \(error.localizedDescription)",
+                             isWarning: true)
+            return false
+        }
     }
 
     // ---------- میانبرهای سراسری ----------
@@ -1560,7 +2639,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // The reconcile loop is stopped while paused, so this is the only
             // thing watching for the change that ends a display pause.
             self?.checkPause()
+            self?.edidCache.removeAll()
             self?.scheduleReconcile(after: 2.0)
+            // A display that was just attached or woke up comes back at
+            // whatever rate macOS chose; this is the one notification that
+            // fires for that whether or not switching is on.
+            self?.scheduleRefreshRateEnforcement(after: 2.5)
         }
     }
 
@@ -1628,6 +2712,7 @@ let displayCallback: CGDisplayReconfigurationCallBack = { display, flags, userIn
     DispatchQueue.main.async {
         monitor.isSleeping = false
         monitor.internalDisplayID = 0 // شناسه ممکن است عوض شده باشد
+        monitor.edidCache.removeAll()
         monitor.resetFailureState()
         monitor.scheduleReconcile(after: 2.0)
     }
