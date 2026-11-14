@@ -26,6 +26,9 @@ enum Preference {
     /// Rates the user kept or turned down, per monitor and resolution.
     static let trustedRefreshRates = "TrustedRefreshRates"
     static let rejectedRefreshRates = "RejectedRefreshRates"
+    /// A rate picked by hand, per monitor. It wins over "Always use highest
+    /// rate", and is put back whenever the monitor comes back at another one.
+    static let pinnedRefreshRates = "PinnedRefreshRates"
 }
 
 // شناسه‌های میانبرها. امضا فقط باید برای این برنامه یکتا باشد.
@@ -493,7 +496,13 @@ struct DisplayInfo: Equatable {
     var id: CGDirectDisplayID
     var isBuiltin: Bool
     var isActive: Bool
+    /// In a mirror set. Only the primary of a hardware mirror set counts as
+    /// active, yet the others still light up and still cost a composite.
+    var isMirrored: Bool
     var name: String
+
+    /// Showing a picture, mirrored or not.
+    var isShowing: Bool { isActive || isMirrored }
 }
 
 /// The refresh rates an external display offers at the resolution it is
@@ -508,6 +517,11 @@ struct RefreshRateInfo: Equatable {
     /// The display's identity plus the pixel size it runs at. A verdict on a
     /// rate is only worth remembering for this monitor at this resolution.
     var verdictKeyPrefix: String
+    /// Vendor, product and serial, which outlive a reconnect or a reboot where
+    /// the CGDirectDisplayID does not.
+    var displayKey: String
+    /// The rate the user picked by hand for this monitor, if any.
+    var pinnedHz: Int?
     var isNativeResolution: Bool
     var nativeSizeLabel: String?
     /// A standard rate the EDID's own limits allow at the native resolution
@@ -530,10 +544,32 @@ struct RefreshRateInfo: Equatable {
         availableHz.map(RefreshRateInfo.label).first { !rejectedHz.contains($0) }
     }
 
+    var availableLabels: [Int] { availableHz.map(RefreshRateInfo.label) }
+
+    /// The pinned rate when this resolution offers it. A pin for a rate the
+    /// current resolution lacks is kept, but does nothing until it applies.
+    var effectivePinHz: Int? {
+        guard let pinned = pinnedHz, availableLabels.contains(pinned) else { return nil }
+        return pinned
+    }
+
+    /// What this monitor should run at, or nil to leave it alone: a pin always
+    /// wins, so a rate the panel skips frames at is never forced back on.
+    func targetHz(preferHighest: Bool) -> Int? {
+        effectivePinHz ?? (preferHighest ? autoTargetHz : nil)
+    }
+
     /// The monitor never claimed this rate itself, so it is only switched to
     /// silently once somebody has seen it work.
     func needsTrial(_ hz: Int) -> Bool {
         isNativeResolution && unlockedHz.contains(hz) && !trustedHz.contains(hz)
+    }
+
+    /// A rate picked by hand switches at once when the monitor claims it, or
+    /// when it was kept before. An untested unlock, or one that was reverted,
+    /// goes through keep-or-revert.
+    func needsConfirmation(_ hz: Int) -> Bool {
+        needsTrial(hz) || rejectedHz.contains(hz)
     }
 
     func verdictKey(_ hz: Int) -> String { "\(verdictKeyPrefix)@\(hz)" }
@@ -622,25 +658,39 @@ extension DetailedTiming {
                   flags: b[17])
     }
 
-    /// VESA CVT reduced blanking, the timing family monitors use for their
+    /// VESA CVT 1.2 reduced blanking, the timing family monitors use for their
     /// high-refresh modes. Version 1 is what nearly every EDID carries;
-    /// version 2 trims the blanking further and needs less bandwidth.
+    /// version 2 trims the blanking further and needs less bandwidth. Built
+    /// to the letter of the spec (progressive, no margins), since a scaler
+    /// that already runs past its comfort zone locks soonest onto the exact
+    /// timing it was validated against.
     static func reducedBlanking(width: Int, height: Int, hz: Double, version: Int) -> DetailedTiming? {
+        // RB_MIN_V_BLANK in µs and MIN_V_BPORCH in lines, common to both.
         let minVBlankMicroseconds = 460.0
+        let minVBackPorch = 6
+        // Version 1 works in 8-pixel character cells. A width that is not a
+        // whole number of cells has no version 1 timing at its exact size.
+        guard height > 0, version != 1 || width % 8 == 0 else { return nil }
         let hPeriodEstimate = (1_000_000 / hz - minVBlankMicroseconds) / Double(height)
         guard hPeriodEstimate > 0 else { return nil }
+        // VBI_LINES = ROUNDDOWN(RB_MIN_V_BLANK / H_PERIOD_EST) + 1, both versions.
+        let vbiLines = Int((minVBlankMicroseconds / hPeriodEstimate).rounded(.down)) + 1
 
         let hBlank, hFront, hSync, vSync, vFront, vBlank: Int
         if version == 1 {
+            // Fixed 160-pixel blank: 48 front porch, 32 sync, 80 back porch.
+            // Fixed 3-line front porch; sync width encodes the aspect ratio.
             (hBlank, hFront, hSync) = (160, 48, 32)
             vSync = cvtVSyncLines(width: width, height: height)
             vFront = 3
-            vBlank = max(Int(minVBlankMicroseconds / hPeriodEstimate) + 1, vFront + vSync + 6)
+            vBlank = max(vbiLines, vFront + vSync + minVBackPorch)
         } else {
+            // Fixed 80-pixel blank: 8 front porch, 32 sync, 40 back porch.
+            // 8-line sync and 6-line back porch; the front porch takes the rest.
             (hBlank, hFront, hSync) = (80, 8, 32)
             vSync = 8
-            vBlank = max(Int((minVBlankMicroseconds / hPeriodEstimate).rounded(.up)), 1 + vSync + 6)
-            vFront = vBlank - vSync - 6
+            vBlank = max(vbiLines, 1 + vSync + minVBackPorch)
+            vFront = vBlank - vSync - minVBackPorch
         }
 
         let clockMHz = hz * Double((width + hBlank) * (height + vBlank)) / 1_000_000
@@ -968,14 +1018,24 @@ struct MenuState: Equatable {
     var refreshRates: [RefreshRateInfo]
     var preferHighestRefreshRate: Bool
 
+    /// Displays a pin keeps below their highest rate, so the switch can say
+    /// why it is on while a monitor is not at the top.
+    var pinnedBelowHighestCount: Int {
+        refreshRates.filter { info in
+            guard let pin = info.effectivePinHz, let top = info.autoTargetHz else { return false }
+            return pin < top
+        }.count
+    }
+
     var internalDisplay: DisplayInfo? { displays.first { $0.isBuiltin } }
     var internalDisplayPresent: Bool { internalDisplay != nil }
-    var internalDisplayActive: Bool { internalDisplay?.isActive ?? false }
-    var externalDisplayCount: Int { displays.filter { !$0.isBuiltin && $0.isActive }.count }
+    var internalDisplayActive: Bool { internalDisplay?.isShowing ?? false }
+    var externalDisplayCount: Int { displays.filter { !$0.isBuiltin && $0.isShowing }.count }
     var isPaused: Bool { pauseMode != nil }
 
     var headerTitle: String {
         guard internalDisplayPresent else { return "Built-in display not detected" }
+        if internalDisplay?.isMirrored == true { return "Internal display is mirroring" }
         return internalDisplayActive ? "Internal display is on" : "Internal display is off"
     }
 
@@ -1154,6 +1214,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     var rejectedRefreshRates: Set<String> = [] {
         didSet { UserDefaults.standard.set(Array(rejectedRefreshRates), forKey: Preference.rejectedRefreshRates) }
+    }
+    /// displayKey to whole-number Hz.
+    var pinnedRefreshRates: [String: Int] = [:] {
+        didSet {
+            guard pinnedRefreshRates != oldValue else { return }
+            UserDefaults.standard.set(pinnedRefreshRates, forKey: Preference.pinnedRefreshRates)
+        }
     }
     // Reading the EDID walks the IORegistry, too slow for a once-a-second
     // menu refresh. Dropped whenever the displays change.
@@ -1374,6 +1441,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             found.append(DisplayInfo(id: id,
                                      isBuiltin: isBuiltin,
                                      isActive: CGDisplayIsActive(id) != 0,
+                                     isMirrored: CGDisplayIsInMirrorSet(id) != 0,
                                      name: displayName(for: id, isBuiltin: isBuiltin)))
         }
 
@@ -1409,6 +1477,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         preferHighestRefreshRate = defaults.bool(forKey: Preference.preferHighestRefreshRate)
         trustedRefreshRates = Set(defaults.stringArray(forKey: Preference.trustedRefreshRates) ?? [])
         rejectedRefreshRates = Set(defaults.stringArray(forKey: Preference.rejectedRefreshRates) ?? [])
+        if let stored = defaults.dictionary(forKey: Preference.pinnedRefreshRates) {
+            pinnedRefreshRates = stored.compactMapValues { ($0 as? NSNumber)?.intValue }
+        }
     }
 
     func render(_ state: MenuState) {
@@ -1473,7 +1544,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 item.isHidden = false
                 row.content = MenuRowContent(symbolNames: display.isBuiltin ? ["laptopcomputer"] : ["display"],
                                              title: display.name,
-                                             accessory: .detail(display.isActive ? "On" : "Off"),
+                                             accessory: .detail(display.isMirrored ? "Mirrored" : display.isActive ? "On" : "Off"),
                                              isInteractive: false)
             } else {
                 item.isHidden = true
@@ -1489,8 +1560,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         refreshRateSeparatorItem.isHidden = !hasExternal
         highestRateItem.isHidden = !hasExternal
 
+        let pinned = state.pinnedBelowHighestCount
         highestRateRow.content = MenuRowContent(symbolNames: ["arrow.up.to.line.compact", "arrow.up.to.line"],
                                                 title: "Always use highest rate",
+                                                hint: state.preferHighestRefreshRate && pinned > 0
+                                                    ? (state.refreshRates.count > 1 ? "\(pinned) pinned" : "pinned lower")
+                                                    : nil,
                                                 accessory: .toggle(isOn: state.preferHighestRefreshRate))
 
         // Each entry is the content of one pooled row plus what a click does.
@@ -1510,10 +1585,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 for hz in info.availableHz {
                     let label = RefreshRateInfo.label(hz)
                     let isCurrent = label == info.currentLabel
+                    // The current rate stays clickable while clicking it would
+                    // pin it, so a rate that was set elsewhere can be kept.
+                    let isInteractive = !isCurrent
+                        || canPin(label, info, preferHighest: state.preferHighestRefreshRate)
                     entries.append((MenuRowContent(symbolNames: isCurrent ? ["checkmark"] : [],
                                                    title: "\(label) Hz",
                                                    hint: refreshRateHint(label, info),
-                                                   isInteractive: !isCurrent),
+                                                   isInteractive: isInteractive),
                                     { [weak self] in self?.chooseRefreshRate(hz, displayID: displayID, name: name) }))
                 }
             }
@@ -1557,6 +1636,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// One word on why a rate is special, most important first.
     func refreshRateHint(_ hz: Int, _ info: RefreshRateInfo) -> String? {
+        if info.pinnedHz == hz { return "pinned" }
         if info.rejectedHz.contains(hz) { return "auto skips" }
         if info.needsTrial(hz) { return "untested" }
         if info.isNativeResolution && info.unlockedHz.contains(hz) { return "unlocked" }
@@ -1767,7 +1847,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func activeExternalCount() -> Int {
-        surveyDisplays().filter { !$0.isBuiltin && $0.isActive }.count
+        surveyDisplays().filter { !$0.isBuiltin && $0.isShowing }.count
     }
 
     // ---------- Menu preferences ----------
@@ -1880,11 +1960,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let rates = refreshModes(all, matching: current).map { $0.refreshRate }
             let available = rates.isEmpty ? [current.refreshRate] : rates
 
+            let key = displayKey(display.id)
             var info = RefreshRateInfo(displayID: display.id,
                                        name: display.name,
                                        currentHz: current.refreshRate,
                                        availableHz: available,
-                                       verdictKeyPrefix: "\(displayKey(display.id))|\(current.pixelWidth)x\(current.pixelHeight)",
+                                       verdictKeyPrefix: "\(key)|\(current.pixelWidth)x\(current.pixelHeight)",
+                                       displayKey: key,
+                                       pinnedHz: pinnedRefreshRates[key],
                                        isNativeResolution: false,
                                        nativeSizeLabel: nil,
                                        unlockCandidateHz: nil,
@@ -1941,31 +2024,58 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return (current, target)
     }
 
-    /// A rate row was clicked. Picking anything below what "Always use highest
-    /// rate" would choose says the user does not want that forced back on.
+    /// Clicking the rate a monitor already runs at pins it, unless that changes
+    /// nothing: it is pinned already, or it is what "highest" picks anyway.
+    func canPin(_ hz: Int, _ info: RefreshRateInfo, preferHighest: Bool) -> Bool {
+        if info.pinnedHz == hz { return false }
+        if preferHighest && info.pinnedHz == nil && info.autoTargetHz == hz { return false }
+        return true
+    }
+
+    /// A rate row was clicked. The pick is pinned to this monitor, so neither a
+    /// reconnect, a reboot nor "Always use highest rate" brings back a rate the
+    /// user moved away from, for example one the panel skips frames at. While
+    /// "highest" is on, picking the rate it would choose anyway lifts the pin.
     func chooseRefreshRate(_ hz: Double, displayID: CGDirectDisplayID, name: String) {
         // A row with a view has to dismiss the menu itself, and the dialog
         // that follows cannot run inside the menu's tracking loop.
         statusItem.menu?.cancelTracking()
         DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
-            if self.preferHighestRefreshRate,
-               let target = self.refreshRateInfo(displayID)?.autoTargetHz,
-               RefreshRateInfo.label(hz) < target {
-                self.preferHighestRefreshRate = false
-                self.sendNotification(title: "Highest Rate Off",
-                                      message: "⏹️ A lower rate was picked by hand, so it is no longer forced.")
+            guard let self = self, let info = self.refreshRateInfo(displayID) else { return }
+            let label = RefreshRateInfo.label(hz)
+            let isSwitch = label != info.currentLabel
+
+            if isSwitch {
+                // A rate the monitor claims, or one kept before, switches at
+                // once; an untested unlock or a reverted rate is checked.
+                guard self.tryRefreshRate(hz, displayID: displayID, name: name,
+                                          confirm: info.needsConfirmation(label)) else { return }
             }
-            self.tryRefreshRate(hz, displayID: displayID, name: name)
+
+            if self.preferHighestRefreshRate && label == info.autoTargetHz {
+                self.pinnedRefreshRates.removeValue(forKey: info.displayKey)
+                if !isSwitch {
+                    self.sendNotification(title: "Refresh Rate",
+                                          message: "⤴️ \(name) follows the highest rate again.")
+                }
+            } else {
+                self.pinnedRefreshRates[info.displayKey] = label
+                if !isSwitch {
+                    self.sendNotification(title: "Refresh Rate",
+                                          message: "📌 \(name) stays at \(label) Hz from now on.")
+                }
+            }
+            self.refreshMenu()
         }
     }
 
-    /// Switches, asks whether the picture is fine, and either keeps it or puts
-    /// the old mode back. The answer is remembered for this monitor: a kept
-    /// rate is trusted for silent switching, a reverted one is never chosen
-    /// automatically again. Letting the dialog run out is not an answer.
+    /// Switches and, with `confirm`, asks whether the picture is fine and
+    /// either keeps it or puts the old mode back. The answer is remembered for
+    /// this monitor: a kept rate is trusted for silent switching, a reverted
+    /// one is never chosen automatically again. Letting the dialog run out is
+    /// not an answer.
     @discardableResult
-    func tryRefreshRate(_ hz: Double, displayID: CGDirectDisplayID, name: String) -> Bool {
+    func tryRefreshRate(_ hz: Double, displayID: CGDirectDisplayID, name: String, confirm: Bool = true) -> Bool {
         guard !isConfirmingRefreshRate else { return false }
         guard let (previous, target) = refreshMode(hz, on: displayID) else {
             sendNotification(title: "Refresh Rate Unavailable",
@@ -1993,6 +2103,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                              message: "⚠️ Could not switch \(name) to \(label) Hz.",
                              isWarning: true)
             return false
+        }
+
+        guard confirm else {
+            sendNotification(title: "Refresh Rate", message: "⚡️ \(name) is now running at \(label) Hz.")
+            return true
         }
 
         switch confirmRefreshRate(label: label, name: name, displayID: displayID, targetModeID: target.ioDisplayModeID) {
@@ -2105,7 +2220,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Switching it on is the moment the user is watching, so every change
         // it makes right now goes through the keep-or-revert check.
         DispatchQueue.main.async { [weak self] in
-            self?.enforceHighestRefreshRates(interactive: true)
+            self?.enforceRefreshRates(interactive: true)
         }
     }
 
@@ -2113,24 +2228,29 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// screen-parameter changes and only the settled state matters.
     func scheduleRefreshRateEnforcement(after delay: TimeInterval) {
         refreshRateWorkItem?.cancel()
-        let item = DispatchWorkItem { [weak self] in self?.enforceHighestRefreshRates() }
+        let item = DispatchWorkItem { [weak self] in self?.enforceRefreshRates() }
         refreshRateWorkItem = item
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
     }
 
-    /// Puts every external display on the best rate it offers that the user
-    /// has not turned down, whatever monitor it is. A rate the monitor lists
-    /// itself, or one the user has kept before, is switched to quietly. One
-    /// that only exists because of an unlock is offered once per launch with
-    /// the keep-or-revert check. Runs whether or not automatic switching is on:
-    /// the refresh rate is a separate matter from the built-in panel.
-    func enforceHighestRefreshRates(interactive: Bool = false) {
-        guard preferHighestRefreshRate, !isSleeping, !isConfirmingRefreshRate else { return }
+    /// Puts every external display back on the rate the user pinned for it,
+    /// and, with "Always use highest rate" on, every unpinned one on the best
+    /// rate it offers that the user has not turned down. A pin goes either way;
+    /// "highest" only ever goes up. A rate the monitor lists itself, or one the
+    /// user has kept before, is switched to quietly. One that only exists
+    /// because of an unlock is offered once per launch with the keep-or-revert
+    /// check. Runs whether or not automatic switching is on: the refresh rate
+    /// is a separate matter from the built-in panel.
+    func enforceRefreshRates(interactive: Bool = false) {
+        guard !isSleeping, !isConfirmingRefreshRate else { return }
 
         for info in surveyRefreshRates(surveyDisplays()) {
-            guard let target = info.autoTargetHz, target > info.currentLabel else { continue }
+            guard let target = info.targetHz(preferHighest: preferHighestRefreshRate),
+                  target != info.currentLabel else { continue }
+            let isPinned = info.effectivePinHz == target
+            guard isPinned || target > info.currentLabel else { continue }
 
-            if interactive || info.needsTrial(target) {
+            if info.needsTrial(target) || (interactive && !isPinned) {
                 let key = info.verdictKey(target)
                 if !interactive {
                     guard !autoTrialsOffered.contains(key) else { continue }
@@ -2153,7 +2273,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                                  isWarning: true)
                 continue
             }
-            sendNotification(title: "Refresh Rate", message: "⚡️ \(info.name) set to \(target) Hz.")
+            sendNotification(title: "Refresh Rate",
+                             message: isPinned
+                                ? "📌 \(info.name) set back to \(target) Hz, the rate picked for it."
+                                : "⚡️ \(info.name) set to \(target) Hz.")
         }
         refreshMenu()
     }
@@ -2476,17 +2599,69 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // تشخیص مانیتور خارجی بر اساس builtin بودن، نه بر اساس شناسه‌ی کش‌شده
+    // A hardware mirror set reports only its primary as active, so an external
+    // display mirroring the built-in panel counts as connected too.
     func hasActiveExternal() -> Bool {
+        onlineDisplays().contains { id in
+            CGDisplayIsBuiltin(id) == 0 && (CGDisplayIsActive(id) != 0 || CGDisplayIsInMirrorSet(id) != 0)
+        }
+    }
+
+    func onlineDisplays() -> [CGDirectDisplayID] {
         var displayCount: UInt32 = 0
         var displays = [CGDirectDisplayID](repeating: 0, count: 16)
-        guard CGGetOnlineDisplayList(16, &displays, &displayCount) == .success else { return false }
+        guard CGGetOnlineDisplayList(16, &displays, &displayCount) == .success else { return [] }
+        return Array(displays.prefix(Int(displayCount)))
+    }
 
-        for i in 0..<Int(displayCount) {
-            if CGDisplayIsBuiltin(displays[i]) == 0 && CGDisplayIsActive(displays[i]) != 0 {
-                return true
+    /// The built-in panel still takes part in the desktop: switched on, or in a
+    /// mirror set. A hardware mirror secondary reports itself inactive while
+    /// WindowServer keeps scaling every frame onto it, so active alone misses it.
+    func internalIsShowing(_ id: CGDirectDisplayID) -> Bool {
+        CGDisplayIsActive(id) != 0 || CGDisplayIsInMirrorSet(id) != 0
+    }
+
+    /// Every display that would have to stop mirroring for the built-in panel
+    /// to leave its mirror set: the panel itself when it mirrors another
+    /// display, and each display that mirrors the panel. A hardware set led by
+    /// the panel is also matched by its primary, in case a secondary does not
+    /// name it. Externals mirroring each other are left alone.
+    func internalMirrorSecondaries(_ builtin: CGDirectDisplayID) -> [CGDirectDisplayID] {
+        guard CGDisplayIsInMirrorSet(builtin) != 0 else { return [] }
+        let internalLeads = CGDisplayPrimaryDisplay(builtin) == builtin
+            && CGDisplayMirrorsDisplay(builtin) == kCGNullDirectDisplay
+        let secondaries = onlineDisplays().filter { id in
+            guard CGDisplayIsInMirrorSet(id) != 0 else { return false }
+            let isSecondary = CGDisplayMirrorsDisplay(id) != kCGNullDirectDisplay || CGDisplayPrimaryDisplay(id) != id
+            guard isSecondary else { return false }
+            return id == builtin
+                || CGDisplayMirrorsDisplay(id) == builtin
+                || (internalLeads && CGDisplayPrimaryDisplay(id) == builtin)
+        }
+        return secondaries.isEmpty ? [builtin] : secondaries
+    }
+
+    /// Takes the built-in panel out of any mirror set. Mirroring a Retina panel
+    /// onto a monitor at another resolution and refresh rate means a scaled
+    /// composite every frame, timed to two clocks at once, which is where the
+    /// stutter in window switching and Mission Control comes from. Saved
+    /// permanently, so the next connect does not mirror again; the panel itself
+    /// is only switched off for the session.
+    func breakInternalMirroring(_ builtin: CGDirectDisplayID) -> Bool {
+        let secondaries = internalMirrorSecondaries(builtin)
+        guard !secondaries.isEmpty else { return true }
+
+        var config: CGDisplayConfigRef?
+        guard CGBeginDisplayConfiguration(&config) == .success else { return false }
+        for id in secondaries {
+            guard CGConfigureDisplayMirrorOfDisplay(config, id, kCGNullDirectDisplay) == .success else {
+                CGCancelDisplayConfiguration(config)
+                return false
             }
         }
-        return false
+        guard CGCompleteDisplayConfiguration(config, .permanently) == .success else { return false }
+        sendNotification(title: "Mirroring Off", message: "🪞 Stopped mirroring the internal display.")
+        return true
     }
 
     func captureBrightness() {
@@ -2517,7 +2692,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard id != 0 else { return false }
 
         // قبل از خاموش کردن نور را صفر می‌کنیم تا در لحظه‌ی تغییر، پنل روشن نماند
-        if !enabled { enforceZeroBrightness(id) }
+        if !enabled {
+            enforceZeroBrightness(id)
+            // A panel in a mirror set cannot simply be switched off: as the
+            // primary it takes the desktop with it, as a secondary the switch
+            // does not stick. Mirroring goes first, in its own transaction,
+            // because it is saved permanently and the switch-off is not.
+            guard breakInternalMirroring(id) else { return false }
+        }
 
         var config: CGDisplayConfigRef?
         guard CGBeginDisplayConfiguration(&config) == .success else { return false }
@@ -2553,7 +2735,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let id = resolveInternalDisplay()
         guard id != 0 else { return }
 
-        let actual = CGDisplayIsActive(id) != 0
+        // Mirrored counts as on: a hardware mirror secondary reports itself
+        // inactive, and taking that at its word left the panel mirrored for good.
+        let actual = internalIsShowing(id)
         let desired = !hasActiveExternal()
 
         // اطلاع‌رسانی فقط وقتی وضعیت واقعی عوض شده، نه در هر بار بررسی
