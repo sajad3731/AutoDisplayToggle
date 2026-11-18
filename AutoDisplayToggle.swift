@@ -3,6 +3,7 @@ import CoreGraphics
 import UserNotifications
 import ServiceManagement
 import IOKit.graphics
+import IOKit.ps
 import Carbon.HIToolbox // برای میانبرهای سراسری
 
 @_silgen_name("CGSConfigureDisplayEnabled")
@@ -15,6 +16,21 @@ func DisplayServicesSetBrightness(_ display: CGDirectDisplayID, _ brightness: Fl
 
 @_silgen_name("DisplayServicesGetBrightness")
 func DisplayServicesGetBrightness(_ display: CGDirectDisplayID, _ brightness: UnsafeMutablePointer<Float>) -> Int32
+
+// The full display mode list, HiDPI sizes included, and the call that sets
+// one by index. See ScaleMode. All return a CGError as a raw 32-bit value.
+@_silgen_name("CGSGetNumberOfDisplayModes")
+func CGSGetNumberOfDisplayModes(_ display: CGDirectDisplayID, _ count: UnsafeMutablePointer<Int32>) -> Int32
+
+@_silgen_name("CGSGetDisplayModeDescriptionOfLength")
+func CGSGetDisplayModeDescriptionOfLength(_ display: CGDirectDisplayID, _ index: Int32,
+                                          _ description: UnsafeMutableRawPointer, _ length: Int32) -> Int32
+
+@_silgen_name("CGSGetCurrentDisplayMode")
+func CGSGetCurrentDisplayMode(_ display: CGDirectDisplayID, _ index: UnsafeMutablePointer<Int32>) -> Int32
+
+@_silgen_name("CGSConfigureDisplayMode")
+func CGSConfigureDisplayMode(_ config: CGDisplayConfigRef?, _ display: CGDirectDisplayID, _ index: Int32) -> Int32
 
 /// The few settings that outlive a launch. A pause is deliberately not one of
 /// them: coming back from a reboot with switching silently off would look like
@@ -29,6 +45,16 @@ enum Preference {
     /// A rate picked by hand, per monitor. It wins over "Always use highest
     /// rate", and is put back whenever the monitor comes back at another one.
     static let pinnedRefreshRates = "PinnedRefreshRates"
+    /// System sleep off while an external display is connected, so the lid
+    /// can close on battery too.
+    static let stayAwakeLidClosed = "StayAwakeWithLidClosed"
+    /// Every display at a size that makes the interface look equally big.
+    static let matchUISize = "MatchUISize"
+    /// The user's offset from that size, in UISize steps.
+    static let uiSizeStep = "UISizeStep"
+    /// Sizes picked by hand in System Settings, per monitor, which matching
+    /// leaves alone until the switch or the slider is touched again.
+    static let uiSizeManual = "UISizeManual"
 }
 
 // شناسه‌های میانبرها. امضا فقط باید برای این برنامه یکتا باشد.
@@ -62,6 +88,8 @@ struct MenuRowContent: Equatable {
     /// does the same thing as this row.
     var hint: String?
     var accessory: MenuRowAccessory = .none
+    /// Shown beside a slider instead of its value as a percentage.
+    var sliderLabel: String?
     var isDestructive = false
     var isInteractive = true
     var isEnabled = true
@@ -221,7 +249,7 @@ final class MenuRowView: NSView {
             toggle.isHidden = true
             slider.isHidden = false
             detailField.isHidden = false
-            detailField.stringValue = "\(Int((value * 100).rounded()))%"
+            detailField.stringValue = content.sliderLabel ?? "\(Int((value * 100).rounded()))%"
             // Never write back the value a drag is already showing, or the knob
             // fights the cursor.
             if abs(slider.doubleValue - value) > 0.005 {
@@ -276,6 +304,12 @@ final class MenuRowView: NSView {
         detailField.textColor = secondary
         hintField.textColor = showsHighlight ? secondary : NSColor.tertiaryLabelColor
         iconView.contentTintColor = showsHighlight ? NSColor.selectedMenuItemTextColor : primary
+    }
+
+    /// Makes the slider snap to `count` evenly spaced stops across its range.
+    func setSliderStops(_ count: Int) {
+        slider.numberOfTickMarks = count
+        slider.allowsTickMarkValuesOnly = true
     }
 
     /// Clears the highlight for a menu that closed with the cursor on this row,
@@ -980,17 +1014,354 @@ enum DisplayOverride {
         "'" + text.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
-    static func runPrivileged(_ command: String) throws {
-        let escaped = command
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
-        let source = "do shell script \"\(escaped)\" with prompt \"AutoDisplayToggle wants to update a display override.\" with administrator privileges"
+    static func runPrivileged(_ command: String,
+                              prompt: String = "AutoDisplayToggle wants to update a display override.") throws {
+        let escape = { (text: String) in
+            text.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+        }
+        let source = "do shell script \"\(escape(command))\" with prompt \"\(escape(prompt))\" with administrator privileges"
         var error: NSDictionary?
         guard let script = NSAppleScript(source: source) else { throw Failure.failed("Could not prepare the request.") }
         script.executeAndReturnError(&error)
         guard let error = error else { return }
         if (error[NSAppleScript.errorNumber] as? Int) == -128 { throw Failure.cancelled }
         throw Failure.failed(error[NSAppleScript.errorMessage] as? String ?? "Unknown error")
+    }
+}
+
+// MARK: - Power
+
+/// Lid, power source and the system-wide sleep switch, read straight from
+/// the power management root domain and IOPowerSources: no process to start,
+/// cheap enough for a timer.
+enum PowerState {
+    private static func rootDomainBool(_ key: String) -> Bool? {
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"))
+        guard service != 0 else { return nil }
+        defer { IOObjectRelease(service) }
+        return IORegistryEntryCreateCFProperty(service, key as CFString, kCFAllocatorDefault, 0)?
+            .takeRetainedValue() as? Bool
+    }
+
+    static var isLidClosed: Bool { rootDomainBool("AppleClamshellState") ?? false }
+    /// Whether a closed lid sleeps the Mac right now. On an Intel notebook
+    /// that is the case on battery, or with no external display.
+    static var lidClosedCausesSleep: Bool { rootDomainBool("AppleClamshellCausesSleep") ?? true }
+    /// `pmset disablesleep`, whoever set it.
+    static var isSleepDisabled: Bool { rootDomainBool("SleepDisabled") ?? false }
+
+    static func battery() -> (onBattery: Bool, percent: Int?) {
+        guard let info = IOPSCopyPowerSourcesInfo()?.takeRetainedValue() else { return (false, nil) }
+        let source = (IOPSGetProvidingPowerSourceType(info)?.takeUnretainedValue()).map { $0 as String }
+        let list = (IOPSCopyPowerSourcesList(info)?.takeRetainedValue() as? [CFTypeRef]) ?? []
+        var percent: Int?
+        for item in list {
+            guard let description = IOPSGetPowerSourceDescription(info, item)?.takeUnretainedValue() as? [String: Any],
+                  description[kIOPSTypeKey] as? String == kIOPSInternalBatteryType,
+                  let current = description[kIOPSCurrentCapacityKey] as? Int,
+                  let maximum = description[kIOPSMaxCapacityKey] as? Int, maximum > 0 else { continue }
+            percent = current * 100 / maximum
+        }
+        return (source == kIOPSBatteryPowerValue, percent)
+    }
+}
+
+/// The two pmset commands that need root, run without a prompt through a
+/// sudoers rule the user installs once from the menu. `sudo -n` never asks
+/// for a password: without the rule it fails, and the app says so.
+enum SleepControl {
+    static let sudoersPath = "/etc/sudoers.d/autodisplaytoggle"
+    static let pmset = "/usr/bin/pmset"
+    static let sudo = "/usr/bin/sudo"
+
+    @discardableResult
+    static func run(_ path: String, _ arguments: [String]) -> Int32 {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = arguments
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do { try process.run() } catch { return -1 }
+        process.waitUntilExit()
+        return process.terminationStatus
+    }
+
+    static func setSleepDisabled(_ disabled: Bool) -> Bool {
+        run(sudo, ["-n", pmset, "-a", "disablesleep", disabled ? "1" : "0"]) == 0
+    }
+
+    @discardableResult
+    static func sleepNow() -> Bool {
+        run(sudo, ["-n", pmset, "sleepnow"]) == 0
+    }
+
+    /// `sudo -l` with a command answers whether that exact command may run,
+    /// and with -n it answers without asking for anything.
+    static var isAuthorized: Bool {
+        [["-a", "disablesleep", "1"], ["-a", "disablesleep", "0"], ["sleepnow"]].allSatisfy {
+            run(sudo, ["-n", "-l", pmset] + $0) == 0
+        }
+    }
+
+    static func authorize() throws {
+        let user = NSUserName()
+        guard user.range(of: "^[A-Za-z0-9._-]+$", options: .regularExpression) != nil else {
+            throw DisplayOverride.Failure.failed("The user name \(user) cannot go into a sudoers rule.")
+        }
+        // Exactly these three commands, with exactly these arguments.
+        let rule = """
+            # Installed by AutoDisplayToggle for "Stay awake with lid closed".
+            # Lets \(user) switch system sleep off and on, and sleep the Mac, without a password.
+            # Delete this file to take that back.
+            \(user) ALL=(root) NOPASSWD: \(pmset) -a disablesleep 0, \(pmset) -a disablesleep 1, \(pmset) sleepnow
+
+            """
+        let fm = FileManager.default
+        let staged = fm.temporaryDirectory.appendingPathComponent("AutoDisplayToggle-sudoers-\(UUID().uuidString)")
+        do {
+            try rule.write(to: staged, atomically: true, encoding: .utf8)
+        } catch {
+            throw DisplayOverride.Failure.failed(error.localizedDescription)
+        }
+        defer { try? fm.removeItem(at: staged) }
+
+        let q = DisplayOverride.shellQuoted
+        // visudo checks the file before it goes live: a broken file in
+        // sudoers.d would lock sudo out for every command, not just these.
+        try DisplayOverride.runPrivileged(
+            "/usr/sbin/visudo -cf \(q(staged.path)) && /usr/bin/install -m 0440 -o root -g wheel \(q(staged.path)) \(q(sudoersPath))",
+            prompt: "AutoDisplayToggle wants to allow switching system sleep off while an external display is connected.")
+    }
+}
+
+// MARK: - Desktop picture
+
+/// macOS draws the desktop in two layers. WallpaperAgent renders the
+/// picture itself into one window per display, and Dock keeps one desktop
+/// window per display and Space above it. A burst of display changes (the
+/// lid opening, the built-in panel coming and going, a resolution change)
+/// can leave either of them laid out for a screen that is gone: the picture
+/// shows cut off, or zoomed over part of the screen. Restarting the process
+/// at fault is the fix macOS offers; launchd starts it again at once.
+enum DesktopPicture {
+    enum Owner: String {
+        case dock = "com.apple.dock"
+        case wallpaper = "com.apple.wallpaper.agent"
+    }
+
+    struct Misfit: Hashable {
+        var owner: Owner
+        var width: Int
+        var height: Int
+    }
+
+    static func pid(_ owner: Owner) -> pid_t? {
+        NSRunningApplication.runningApplications(withBundleIdentifier: owner.rawValue).first?.processIdentifier
+    }
+
+    static func activeDisplays() -> [CGDirectDisplayID] {
+        var count: UInt32 = 0
+        var ids = [CGDirectDisplayID](repeating: 0, count: 16)
+        guard CGGetActiveDisplayList(16, &ids, &count) == .success else { return [] }
+        return Array(ids.prefix(Int(count)))
+    }
+
+    /// Where every active display sits and how big it is. A change here is
+    /// what desktop layers fail to follow.
+    static func geometry() -> [String] {
+        activeDisplays().map { id in
+            let b = CGDisplayBounds(id)
+            return "\(id):\(Int(b.minX)),\(Int(b.minY)),\(Int(b.width))x\(Int(b.height))"
+        }.sorted()
+    }
+
+    /// Desktop windows laid out for a screen that is not there. Three kinds:
+    ///
+    /// - A Dock or WallpaperAgent desktop window on any Space, parked at an
+    ///   active display's corner but sized for another display. This is the
+    ///   one seen in practice: when the built-in panel goes dark, Dock moves
+    ///   the panel's desktop window onto the external display instead of
+    ///   dropping it, and the picture shows at the panel's size over part of
+    ///   the screen. Other Spaces count too, since switching to one shows it,
+    ///   and nothing else would look again then.
+    /// - Any on-screen one of theirs sized for no active display. Origins
+    ///   wander while Spaces animate, so only the size is compared.
+    /// - loginwindow's own desktop copy, when it sits in front of the picture
+    ///   at the wrong size. Windows come front to back, which is how "in
+    ///   front" is told.
+    ///
+    /// Bounds and owners are readable without Screen Recording permission;
+    /// titles are not needed.
+    static func misfits() -> [Misfit] {
+        let displays = activeDisplays().map { CGDisplayBounds($0) }
+        guard !displays.isEmpty else { return [] }
+        var owners: [pid_t: Owner] = [:]
+        for owner in [Owner.dock, .wallpaper] {
+            if let pid = pid(owner) { owners[pid] = owner }
+        }
+        let loginWindowPID = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.loginwindow")
+            .first?.processIdentifier
+        // Dock's own bar, Mission Control and the like sit far above this.
+        let desktopIconLevel = Int(CGWindowLevelForKey(.desktopIconWindow))
+
+        func desktopWindows(_ option: CGWindowListOption) -> [(pid: pid_t, bounds: CGRect)] {
+            let list = (CGWindowListCopyWindowInfo(option, kCGNullWindowID) as? [[String: Any]]) ?? []
+            return list.compactMap { window in
+                guard let ownerPID = (window[kCGWindowOwnerPID as String] as? Int).map(pid_t.init),
+                      let layer = window[kCGWindowLayer as String] as? Int, layer < desktopIconLevel,
+                      let boundsInfo = window[kCGWindowBounds as String] as? NSDictionary,
+                      let bounds = CGRect(dictionaryRepresentation: boundsInfo as CFDictionary) else { return nil }
+                return (ownerPID, bounds)
+            }
+        }
+        func sameSize(_ a: CGRect, _ b: CGRect) -> Bool {
+            abs(a.width - b.width) < 1 && abs(a.height - b.height) < 1
+        }
+
+        var found = Set<Misfit>()
+        for (ownerPID, bounds) in desktopWindows([.optionAll]) {
+            guard let owner = owners[ownerPID],
+                  let display = displays.first(where: { abs($0.minX - bounds.minX) < 1 && abs($0.minY - bounds.minY) < 1 }),
+                  !sameSize(display, bounds) else { continue }
+            found.insert(Misfit(owner: owner, width: Int(bounds.width), height: Int(bounds.height)))
+        }
+
+        var pictureSeen = false
+        for (ownerPID, bounds) in desktopWindows([.optionOnScreenOnly]) {
+            let owner = owners[ownerPID]
+            if owner == .wallpaper { pictureSeen = true }
+            guard !displays.contains(where: { sameSize($0, bounds) }) else { continue }
+            if let owner = owner {
+                found.insert(Misfit(owner: owner, width: Int(bounds.width), height: Int(bounds.height)))
+            } else if ownerPID == loginWindowPID, !pictureSeen {
+                found.insert(Misfit(owner: .wallpaper, width: Int(bounds.width), height: Int(bounds.height)))
+            }
+        }
+        return Array(found)
+    }
+
+    /// The same as `killall`; launchd starts it again at once.
+    static func restart(_ owner: Owner) -> Bool {
+        guard let pid = pid(owner) else { return false }
+        return kill(pid, SIGTERM) == 0
+    }
+}
+
+// MARK: - Display modes and UI size
+
+/// One entry of the full mode list: a size in points, its pixel density and
+/// its refresh rate, addressed by index. The public CGDisplayCopyAllDisplayModes
+/// leaves out most HiDPI sizes a display override adds, and
+/// CGConfigureDisplayWithDisplayMode refuses some it does list, so sizes are
+/// read and set through the private calls System Settings uses.
+struct ScaleMode: Equatable {
+    var index: Int32
+    var width: Int
+    var height: Int
+    var hz: Int
+    var density: Float
+
+    var isHiDPI: Bool { density > 1.5 }
+    var pixelWidth: Int { Int((Float(width) * max(density, 1)).rounded()) }
+    var sizeKey: String { "\(width)x\(height)\(isHiDPI ? " HiDPI" : "")" }
+
+    /// The description record is 0xD4 bytes: width at 8, height at 12, the
+    /// refresh rate at 190 and the density (2 for HiDPI) at 208.
+    static let descriptionLength = 0xD4
+
+    static func all(for id: CGDirectDisplayID) -> [ScaleMode] {
+        var count: Int32 = 0
+        guard CGSGetNumberOfDisplayModes(id, &count) == 0, count > 0 else { return [] }
+        var bytes = [UInt8](repeating: 0, count: descriptionLength)
+        var modes: [ScaleMode] = []
+        for index in 0..<count {
+            let status = bytes.withUnsafeMutableBytes {
+                CGSGetDisplayModeDescriptionOfLength(id, index, $0.baseAddress!, Int32(descriptionLength))
+            }
+            guard status == 0 else { continue }
+            let mode = bytes.withUnsafeBytes { raw in
+                ScaleMode(index: index,
+                          width: Int(raw.load(fromByteOffset: 8, as: UInt32.self)),
+                          height: Int(raw.load(fromByteOffset: 12, as: UInt32.self)),
+                          hz: Int(raw.load(fromByteOffset: 190, as: UInt16.self)),
+                          density: raw.load(fromByteOffset: 208, as: Float.self))
+            }
+            if mode.width > 0 && mode.height > 0 { modes.append(mode) }
+        }
+        return modes
+    }
+
+    static func current(for id: CGDirectDisplayID, in modes: [ScaleMode]) -> ScaleMode? {
+        var index: Int32 = -1
+        guard CGSGetCurrentDisplayMode(id, &index) == 0 else { return nil }
+        return modes.first { $0.index == index }
+    }
+}
+
+/// Picks the size each display runs at so that text and controls come out
+/// the same size to the eye on every one of them, instead of every app being
+/// zoomed by hand after each move between screens. Sizes are compared in
+/// points per inch of the physical panel, from its EDID.
+enum UISize {
+    /// Apple's own desktop displays (Studio Display, Pro Display XDR, iMac)
+    /// open at about 109 points per inch. They sit further away than a
+    /// laptop panel, which Apple runs denser.
+    static let externalPointsPerInch = 109.0
+    /// For a built-in panel that marks no default mode.
+    static let builtinFallbackPointsPerInch = 127.0
+    /// One slider step makes everything about 6% larger or smaller.
+    static let stepFactor = 1.06
+    static let steps = -3...3
+    /// A scaled HiDPI size on an external display draws more pixels than the
+    /// panel has and scales them down every frame. The panel's own pixels
+    /// cost nothing extra, so they win unless a scaled size is clearly closer.
+    static let scaledPenalty = 0.05
+
+    static func target(base: Double, step: Int) -> Double {
+        base / pow(stepFactor, Double(step))
+    }
+
+    /// How much larger than default one step setting makes things, e.g. "+12%".
+    static func label(step: Int) -> String {
+        guard step != 0 else { return "Default" }
+        let percent = Int(((pow(stepFactor, Double(step)) - 1) * 100).rounded())
+        return percent > 0 ? "+\(percent)%" : "−\(-percent)%"
+    }
+
+    /// `native` is the panel's own pixel size. It has to come from outside:
+    /// the full list also holds every scaled framebuffer size, up to twice
+    /// the panel in each direction, as low resolution modes.
+    static func best(modes: [ScaleMode], current: ScaleMode, native: (width: Int, height: Int),
+                     widthInches: Double, target: Double, isBuiltin: Bool, preferredHz: Int?) -> ScaleMode? {
+        let nativeWidth = native.width
+        let nativeAspect = Double(native.width) / Double(native.height)
+
+        let candidates = modes.filter { mode in
+            // Another aspect ratio would letterbox or stretch the picture.
+            guard abs(Double(mode.width) / Double(mode.height) - nativeAspect) < 0.02 else { return false }
+            if mode.isHiDPI { return true }
+            // Low resolution only at the panel's own pixels: anything else
+            // is stretched and blurry. A Retina panel at 1:1 is unreadable.
+            return !isBuiltin && mode.width == nativeWidth
+        }
+
+        // One mode per size, at the rate the display runs or is pinned to.
+        let picks = Dictionary(grouping: candidates, by: { $0.sizeKey }).values.compactMap { group -> ScaleMode? in
+            if let hz = preferredHz, let mode = group.first(where: { abs($0.hz - hz) <= 1 }) { return mode }
+            if let mode = group.first(where: { $0.hz == current.hz }) { return mode }
+            return group.max { $0.hz < $1.hz }
+        }
+
+        func score(_ mode: ScaleMode) -> Double {
+            var score = abs(log(Double(mode.width) / widthInches / target))
+            if !isBuiltin && mode.isHiDPI && mode.pixelWidth != nativeWidth { score += scaledPenalty }
+            return score
+        }
+        return picks.min { lhs, rhs in
+            let (a, b) = (score(lhs), score(rhs))
+            // Ties go to the larger size, for a stable answer.
+            return a != b ? a < b : lhs.width > rhs.width
+        }
     }
 }
 
@@ -1017,6 +1388,20 @@ struct MenuState: Equatable {
     var pauseMinutesRemaining: Int?
     var refreshRates: [RefreshRateInfo]
     var preferHighestRefreshRate: Bool
+    var matchUISize: Bool
+    var uiSizeStep: Int
+    var stayAwakeLidClosed: Bool
+    /// This app has system sleep switched off right now.
+    var lidAwakeActive: Bool
+    var lidAwakeHeldForBattery: Bool
+
+    /// Says whether the switch is doing anything at the moment, since sleep
+    /// being off is the part worth knowing about.
+    var lidAwakeHint: String? {
+        guard stayAwakeLidClosed else { return nil }
+        if lidAwakeHeldForBattery { return "low battery" }
+        return lidAwakeActive ? "sleep off" : "no display"
+    }
 
     /// Displays a pin keeps below their highest rate, so the switch can say
     /// why it is on while a monitor is not at the top.
@@ -1172,6 +1557,87 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var displayRowItems: [NSMenuItem] = []
     var menuRows: [MenuRowView] = []
     var renderedMenuState: MenuState?
+    /// What the menu bar icon last showed while the menu was closed.
+    var renderedStatusState: MenuState?
+    var isMenuOpen = false
+    var lidAwakeRow: MenuRowView!
+
+    // Stay awake with the lid closed: system sleep off while an external
+    // display is connected. macOS on an Intel notebook only keeps a closed
+    // Mac awake on power; on battery it sleeps, monitor or not.
+    var stayAwakeLidClosed = false {
+        didSet {
+            guard stayAwakeLidClosed != oldValue else { return }
+            UserDefaults.standard.set(stayAwakeLidClosed, forKey: Preference.stayAwakeLidClosed)
+        }
+    }
+    /// What this app last set `disablesleep` to. Nil while it has not touched
+    /// it, so a value somebody else set is left alone.
+    var appliedSleepDisabled: Bool?
+    var lidAwakeHeldForBattery = false
+    var reportedSleepReleaseFailure = false
+    let lidAwakeBatteryFloor = 10
+    let lidAwakeBatteryResume = 15
+    var lidAwakeTimer: Timer?
+    var powerSourceRunLoopSource: CFRunLoopSource?
+
+    // Desktop picture repair. A misfit has to survive a second look, and the
+    // desktop is redrawn at most every half minute however often the
+    // displays change; a repair held back by that runs once the time is up.
+    var desktopCheckWorkItem: DispatchWorkItem?
+    var lastDesktopRepair: Date?
+    let desktopRepairMinimumInterval: TimeInterval = 30
+    let desktopCheckSettleDelay: TimeInterval = 5
+    let desktopCheckConfirmDelay: TimeInterval = 3
+    /// The display layout the desktop was last known to match.
+    var lastDesktopGeometry: [String]?
+    /// Set whenever this app changes the layout itself, so a change that is
+    /// undone within the settle time (the lid opening, then the panel going
+    /// dark again) still gets its redraw.
+    var desktopNeedsRedraw = false
+    /// Misfits that came straight back after a restart. They are left alone
+    /// until the layout changes, rather than restarting Dock forever.
+    var repairedMisfits: Set<DesktopPicture.Misfit> = []
+    /// Dock can move a stale desktop window into place well after a layout
+    /// change has settled, so the desktop is looked at again later on too.
+    let desktopFollowUpDelays: [TimeInterval] = [30, 90]
+    var desktopFollowUpGeneration = 0
+    var ignoredMisfits: Set<DesktopPicture.Misfit> = []
+
+    // Matched UI size: every display at a size that makes the interface look
+    // equally big, plus the user's offset in steps. A display is matched once
+    // each time it appears; a size picked in System Settings afterwards stands
+    // until the display comes back.
+    var matchUISize = false {
+        didSet {
+            guard matchUISize != oldValue else { return }
+            UserDefaults.standard.set(matchUISize, forKey: Preference.matchUISize)
+        }
+    }
+    var uiSizeStep = 0 {
+        didSet {
+            guard uiSizeStep != oldValue else { return }
+            UserDefaults.standard.set(uiSizeStep, forKey: Preference.uiSizeStep)
+        }
+    }
+    /// displayKey to the size it was matched to while it has been active.
+    var uiSizeMatched: [String: String] = [:]
+    /// displayKey to a size picked by hand after matching. Kept across
+    /// launches, so a login does not undo it.
+    var uiSizeManual: [String: String] = [:] {
+        didSet {
+            guard uiSizeManual != oldValue else { return }
+            UserDefaults.standard.set(uiSizeManual, forKey: Preference.uiSizeManual)
+        }
+    }
+    /// The slider moved while the menu was open. Display sizes change once it
+    /// closes: resizing the screen under an open menu would close it anyway.
+    var uiSizeStepChanged = false
+    var uiSizeWorkItem: DispatchWorkItem?
+    var uiSizeForcePending = false
+    var uiSizeRow: MenuRowView!
+    var uiSizeSliderRow: MenuRowView!
+    var uiSizeSliderItem: NSMenuItem!
     var menuRefreshTimer: Timer?
     // The hot keys are claimed after the menu is built, so the menu only
     // advertises a shortcut once it is really ours.
@@ -1205,6 +1671,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // A display that will not hold a rate would otherwise be retried on every
     // reconfiguration it causes, flickering forever.
     var lastAutoRefreshAttempt: [CGDirectDisplayID: Date] = [:]
+    /// Monitors seen by the last enforcement pass. One missing from it has
+    /// just appeared, and only those get their rate put right.
+    var refreshRatePresentKeys: Set<String> = []
     let autoRefreshRetryInterval: TimeInterval = 30
     // An untested rate is offered once per launch; ignoring the dialog is not
     // an answer, so it is not remembered as one.
@@ -1247,6 +1716,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         setupTerminationHandlers()
         startMonitoring()
         scheduleRefreshRateEnforcement(after: 2.0)
+        setupPowerSourceWatch()
+        if stayAwakeLidClosed { startLidAwakeTimer() }
+        updateLidAwake()
+        scheduleUISizeMatch(after: 3)
+        scheduleDesktopPictureCheck(after: 6)
         // پیام خوش‌آمد بعد از تعیین‌تکلیف مجوز نوتیفیکیشن فرستاده می‌شود
         // تا اولین نوتیفیکیشن هم با آیکن خود برنامه نمایش داده شود.
         setupNotifications {
@@ -1336,9 +1810,29 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(NSMenuItem.separator())
 
+        uiSizeRow = MenuRowView(style: .single)
+        uiSizeRow.onClick = { [weak self] in self?.toggleMatchUISize() }
+        menu.addItem(rowItem(uiSizeRow, accessibilityTitle: "Match UI size on all displays"))
+
+        uiSizeSliderRow = MenuRowView(style: .slider)
+        uiSizeSliderRow.setSliderStops(UISize.steps.count)
+        uiSizeSliderRow.onSliderChange = { [weak self] value in
+            self?.setUISizeStep(AppDelegate.uiSizeStep(forSliderValue: value))
+        }
+        // Enabled for the same reason as the brightness row: the slider
+        // needs the drag.
+        uiSizeSliderItem = rowItem(uiSizeSliderRow, accessibilityTitle: "UI size")
+        menu.addItem(uiSizeSliderItem)
+
+        menu.addItem(NSMenuItem.separator())
+
         notificationsRow = MenuRowView(style: .single)
         notificationsRow.onClick = { [weak self] in self?.toggleNotifications() }
         menu.addItem(rowItem(notificationsRow, accessibilityTitle: "Notifications"))
+
+        lidAwakeRow = MenuRowView(style: .single)
+        lidAwakeRow.onClick = { [weak self] in self?.toggleStayAwakeLidClosed() }
+        menu.addItem(rowItem(lidAwakeRow, accessibilityTitle: "Stay awake with lid closed"))
 
         loginRow = MenuRowView(style: .single)
         loginRow.onClick = { [weak self] in self?.toggleLoginItem() }
@@ -1377,7 +1871,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         statusItem.menu = menu
         let fixedRows: [MenuRowView] = [statusRow, switchingRow, brightnessRow, pauseHourRow,
-                                        pauseUntilChangeRow, resumeRow, notificationsRow, loginRow,
+                                        pauseUntilChangeRow, resumeRow, notificationsRow, lidAwakeRow, loginRow,
+                                        uiSizeRow, uiSizeSliderRow,
                                         panicRow, quitRow, highestRateRow]
         menuRows = fixedRows + displayRows + refreshRateRows
         refreshMenu()
@@ -1397,28 +1892,50 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Reads the current state once and hands it to the rows. Skipping the
     /// render when nothing changed keeps this cheap enough to call from the
     /// reconcile loop and from a timer while the menu is open.
+    ///
+    /// With the menu closed only the menu bar icon is on screen, so only what
+    /// the icon shows is read. The full survey copies every mode of every
+    /// external display (well over a hundred on a QHD monitor) and asks the
+    /// login item service for its status, and the reconcile loop would
+    /// otherwise pay for that every five seconds around the clock.
     @objc func refreshMenu() {
         // menuRows is filled in last, so it stands for "the menu exists".
         guard statusItem != nil, !menuRows.isEmpty else { return }
 
+        guard isMenuOpen else {
+            let state = currentMenuState(full: false)
+            guard state != renderedStatusState else { return }
+            renderedStatusState = state
+            renderStatusButton(state)
+            return
+        }
+
         let state = currentMenuState()
         guard state != renderedMenuState else { return }
         renderedMenuState = state
+        renderedStatusState = nil
         render(state)
     }
 
-    func currentMenuState() -> MenuState {
+    /// `full: false` leaves out the refresh rates and the login item, which
+    /// only the open menu shows.
+    func currentMenuState(full: Bool = true) -> MenuState {
         let displays = surveyDisplays()
         return MenuState(isEnabled: isEnabled,
                          displays: displays,
-                         loginItem: currentLoginItemState(),
+                         loginItem: full ? currentLoginItemState() : (renderedMenuState?.loginItem ?? .off),
                          hotKeysRegistered: hotKeysRegistered,
                          notificationsEnabled: notificationsEnabled,
                          restoreBrightness: savedBrightness,
                          pauseMode: pauseMode,
                          pauseMinutesRemaining: pauseMinutesRemaining,
-                         refreshRates: surveyRefreshRates(displays),
-                         preferHighestRefreshRate: preferHighestRefreshRate)
+                         refreshRates: full ? surveyRefreshRates(displays) : [],
+                         preferHighestRefreshRate: preferHighestRefreshRate,
+                         matchUISize: matchUISize,
+                         uiSizeStep: uiSizeStep,
+                         stayAwakeLidClosed: stayAwakeLidClosed,
+                         lidAwakeActive: appliedSleepDisabled == true,
+                         lidAwakeHeldForBattery: lidAwakeHeldForBattery)
     }
 
     /// Rounded up, so a pause with thirty seconds left still reads as a minute.
@@ -1480,6 +1997,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if let stored = defaults.dictionary(forKey: Preference.pinnedRefreshRates) {
             pinnedRefreshRates = stored.compactMapValues { ($0 as? NSNumber)?.intValue }
         }
+        matchUISize = defaults.bool(forKey: Preference.matchUISize)
+        uiSizeManual = (defaults.dictionary(forKey: Preference.uiSizeManual) as? [String: String]) ?? [:]
+        uiSizeStep = min(max(defaults.integer(forKey: Preference.uiSizeStep), UISize.steps.lowerBound),
+                         UISize.steps.upperBound)
+        stayAwakeLidClosed = defaults.bool(forKey: Preference.stayAwakeLidClosed)
+        // A run that ended without a clean exit can leave sleep off; with the
+        // switch on, that is taken as this app's doing, so it gets undone.
+        if stayAwakeLidClosed, PowerState.isSleepDisabled { appliedSleepDisabled = true }
     }
 
     func render(_ state: MenuState) {
@@ -1516,6 +2041,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                                                   title: "Notifications",
                                                   hint: state.notificationsHint,
                                                   accessory: .toggle(isOn: state.notificationsEnabled))
+
+        uiSizeRow.content = MenuRowContent(symbolNames: ["textformat.size", "textformat"],
+                                           title: "Match UI size on all displays",
+                                           accessory: .toggle(isOn: state.matchUISize))
+        uiSizeSliderItem.isHidden = !state.matchUISize
+        uiSizeSliderRow.content = MenuRowContent(symbolNames: ["plus.magnifyingglass", "textformat.size.larger"],
+                                                 title: "UI size",
+                                                 accessory: .slider(value: AppDelegate.sliderValue(forUISizeStep: state.uiSizeStep)),
+                                                 sliderLabel: UISize.label(step: state.uiSizeStep),
+                                                 isInteractive: false)
+
+        lidAwakeRow.content = MenuRowContent(symbolNames: ["powersleep", "moon.zzz"],
+                                             title: "Stay awake with lid closed",
+                                             hint: state.lidAwakeHint,
+                                             accessory: .toggle(isOn: state.stayAwakeLidClosed))
 
         loginRow.content = MenuRowContent(symbolNames: ["power"],
                                           title: "Start at Login",
@@ -2244,7 +2784,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func enforceRefreshRates(interactive: Bool = false) {
         guard !isSleeping, !isConfirmingRefreshRate else { return }
 
-        for info in surveyRefreshRates(surveyDisplays()) {
+        let infos = surveyRefreshRates(surveyDisplays())
+        let present = refreshRatePresentKeys
+        refreshRatePresentKeys = Set(infos.map { $0.displayKey })
+
+        for info in infos {
+            // Rates are put right when a display appears: connected, at
+            // launch, after a wake. A rate that changes while the display
+            // stays connected was picked in System Settings or on the monitor,
+            // so it becomes the pin instead of being forced back.
+            if !interactive, present.contains(info.displayKey) {
+                if let pin = info.pinnedHz, pin != info.currentLabel {
+                    pinnedRefreshRates[info.displayKey] = info.currentLabel
+                    sendNotification(title: "Refresh Rate",
+                                     message: "📌 \(info.name) stays at \(info.currentLabel) Hz from now on, as set.")
+                }
+                continue
+            }
+
             guard let target = info.targetHz(preferHighest: preferHighestRefreshRate),
                   target != info.currentLabel else { continue }
             let isPinned = info.effectivePinHz == target
@@ -2383,6 +2940,411 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    // ---------- Stay awake with lid closed ----------
+
+    /// Switching it off flips in place. Switching it on explains what it costs
+    /// first and may need the one-time administrator prompt, so the menu goes.
+    func toggleStayAwakeLidClosed() {
+        guard !stayAwakeLidClosed else {
+            stayAwakeLidClosed = false
+            stopLidAwakeTimer()
+            updateLidAwake()
+            sendNotification(title: "Normal Sleep",
+                             message: "🌙 A closed Mac on battery sleeps again, monitor or not.")
+            return
+        }
+        statusItem.menu?.cancelTracking()
+        DispatchQueue.main.async { [weak self] in self?.enableStayAwakeLidClosed() }
+    }
+
+    func enableStayAwakeLidClosed() {
+        let alert = NSAlert()
+        alert.messageText = "Stay awake with the lid closed?"
+        alert.informativeText = """
+            On battery, macOS sleeps this Mac when the lid closes, even with a monitor connected. \
+            With this on, system sleep is switched off whenever an external display is connected, \
+            so the lid can close on battery too. While it is off, the Mac does not sleep when idle \
+            or from the Apple menu either. Displays still sleep.
+
+            Sleep comes back as soon as the last external display is unplugged, and a closed Mac is \
+            put to sleep right then. It also comes back below \(lidAwakeBatteryFloor)% battery. If \
+            the app is force quit or crashes while sleep is off, sleep stays off until the app runs again.
+
+            The first time, macOS asks for an administrator password to add a rule in \
+            \(SleepControl.sudoersPath) that lets AutoDisplayToggle run "pmset disablesleep" and \
+            "pmset sleepnow" without asking.
+            """
+        alert.addButton(withTitle: "Turn On")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        if !SleepControl.isAuthorized {
+            do {
+                try SleepControl.authorize()
+            } catch DisplayOverride.Failure.cancelled {
+                return
+            } catch DisplayOverride.Failure.failed(let message) {
+                sendNotification(title: "Stay Awake Unavailable", message: "⚠️ \(message)", isWarning: true)
+                return
+            } catch {
+                sendNotification(title: "Stay Awake Unavailable",
+                                 message: "⚠️ \(error.localizedDescription)",
+                                 isWarning: true)
+                return
+            }
+            guard SleepControl.isAuthorized else {
+                sendNotification(title: "Stay Awake Unavailable",
+                                 message: "⚠️ The sudoers rule is in place but sudo does not accept it.",
+                                 isWarning: true)
+                return
+            }
+        }
+
+        stayAwakeLidClosed = true
+        reportedSleepReleaseFailure = false
+        startLidAwakeTimer()
+        updateLidAwake()
+        sendNotification(title: "Stay Awake On",
+                         message: "☕️ The lid can close on battery while a monitor is connected.")
+    }
+
+    /// Any external display that is connected, asleep or not. A display in
+    /// display sleep is not active, and releasing sleep then would let a
+    /// closed Mac sleep the moment its monitor dims.
+    func hasOnlineExternal() -> Bool {
+        onlineDisplays().contains { CGDisplayIsBuiltin($0) == 0 }
+    }
+
+    func wantsSleepDisabled() -> Bool {
+        guard stayAwakeLidClosed, hasOnlineExternal() else {
+            lidAwakeHeldForBattery = false
+            return false
+        }
+        // A floor and a higher resume point, so a battery hovering at the
+        // floor does not switch sleep off and on with every percent.
+        let power = PowerState.battery()
+        if power.onBattery, let percent = power.percent {
+            if percent <= lidAwakeBatteryFloor {
+                lidAwakeHeldForBattery = true
+            } else if percent >= lidAwakeBatteryResume {
+                lidAwakeHeldForBattery = false
+            }
+        } else {
+            lidAwakeHeldForBattery = false
+        }
+        return !lidAwakeHeldForBattery
+    }
+
+    /// Brings `disablesleep` in line with the switch, the displays and the
+    /// battery. Cheap when nothing changes: sudo only runs on a change.
+    @objc func updateLidAwake() {
+        defer { refreshMenu() }
+
+        if wantsSleepDisabled() {
+            // Re-applied if somebody else switched sleep back on meanwhile.
+            guard appliedSleepDisabled != true || !PowerState.isSleepDisabled else { return }
+            if SleepControl.setSleepDisabled(true) {
+                appliedSleepDisabled = true
+                return
+            }
+            // The rule is gone or sudo changed. Normal sleep is the safe
+            // place to land, rather than retrying quietly forever.
+            stayAwakeLidClosed = false
+            stopLidAwakeTimer()
+            sendNotification(title: "Stay Awake Off",
+                             message: "⚠️ Could not switch sleep off. Turn the switch on again to re-authorize.",
+                             isWarning: true)
+            return
+        }
+
+        guard appliedSleepDisabled == true else { return }
+        guard SleepControl.setSleepDisabled(false) else {
+            if !reportedSleepReleaseFailure {
+                reportedSleepReleaseFailure = true
+                sendNotification(title: "Sleep Still Off",
+                                 message: "⚠️ Could not switch sleep back on. Run: sudo pmset -a disablesleep 0",
+                                 isWarning: true)
+            }
+            return
+        }
+        appliedSleepDisabled = false
+        reportedSleepReleaseFailure = false
+        // The lid may have closed while sleep was off, say when the monitor
+        // was unplugged on the way out. macOS does not look at the lid again
+        // when sleep comes back, so a Mac headed for a bag is put to sleep.
+        if PowerState.isLidClosed && PowerState.lidClosedCausesSleep {
+            SleepControl.sleepNow()
+        }
+    }
+
+    /// Catches what no notification reports, such as the battery crossing
+    /// the floor between power source callbacks. Only runs while it matters.
+    func startLidAwakeTimer() {
+        stopLidAwakeTimer()
+        let timer = Timer(timeInterval: 15, target: self, selector: #selector(updateLidAwake), userInfo: nil, repeats: true)
+        timer.tolerance = 5
+        RunLoop.main.add(timer, forMode: .common)
+        lidAwakeTimer = timer
+    }
+
+    func stopLidAwakeTimer() {
+        lidAwakeTimer?.invalidate()
+        lidAwakeTimer = nil
+    }
+
+    /// Plugging and unplugging the charger, straight from IOPowerSources.
+    func setupPowerSourceWatch() {
+        let context = Unmanaged.passUnretained(self).toOpaque()
+        guard let source = IOPSNotificationCreateRunLoopSource(powerSourceCallback, context)?.takeRetainedValue() else {
+            return
+        }
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+        powerSourceRunLoopSource = source
+    }
+
+    // ---------- Desktop picture ----------
+
+    /// Debounced like the reconcile: only the settled arrangement is worth
+    /// judging, and Dock and WallpaperAgent need a moment after any change.
+    func scheduleDesktopPictureCheck(after delay: TimeInterval? = nil, confirming: Bool = false) {
+        desktopCheckWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in self?.checkDesktopPicture(confirming: confirming) }
+        desktopCheckWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + (delay ?? desktopCheckSettleDelay), execute: item)
+    }
+
+    /// The settled check, plus later looks that a newer change supersedes.
+    func scheduleDesktopPictureChecksAfterLayoutChange() {
+        scheduleDesktopPictureCheck()
+        desktopFollowUpGeneration += 1
+        let generation = desktopFollowUpGeneration
+        for delay in desktopFollowUpDelays {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self = self, self.desktopFollowUpGeneration == generation else { return }
+                self.scheduleDesktopPictureCheck(after: 0)
+            }
+        }
+    }
+
+    /// Redraws the desktop after the display layout changed, and restarts
+    /// Dock when one of its desktop windows is sized for a screen that is not
+    /// there. WallpaperAgent can keep the right window size with the wrong
+    /// picture inside it, which nothing outside it can see, so every settled
+    /// layout change gets a redraw: it costs a blink of the desktop picture.
+    /// Whatever triggers a repair has to show up twice, a few seconds apart,
+    /// so a Space switch or a change still in flight never counts.
+    func checkDesktopPicture(confirming: Bool) {
+        guard !isSleeping else { return }
+        // Not under an open menu or a dialog: a restart would close or cover
+        // them. Asked again once they are gone.
+        guard !isMenuOpen, !isConfirmingRefreshRate else {
+            scheduleDesktopPictureCheck()
+            return
+        }
+
+        let geometry = DesktopPicture.geometry()
+        let layoutChanged = lastDesktopGeometry.map { $0 != geometry } ?? false
+        if layoutChanged { ignoredMisfits.removeAll() }
+
+        let misfits = Set(DesktopPicture.misfits()).subtracting(ignoredMisfits)
+        // A misfit that survived its own repair is not one a restart fixes.
+        let stubborn = misfits.intersection(repairedMisfits)
+        if !layoutChanged && !stubborn.isEmpty {
+            ignoredMisfits.formUnion(stubborn)
+            repairedMisfits.removeAll()
+            return
+        }
+
+        let needsRedraw = layoutChanged || desktopNeedsRedraw
+        guard needsRedraw || !misfits.isEmpty else {
+            lastDesktopGeometry = geometry
+            repairedMisfits.removeAll()
+            return
+        }
+        guard confirming else {
+            scheduleDesktopPictureCheck(after: desktopCheckConfirmDelay, confirming: true)
+            return
+        }
+        if let last = lastDesktopRepair {
+            let wait = desktopRepairMinimumInterval - Date().timeIntervalSince(last)
+            if wait > 0 {
+                scheduleDesktopPictureCheck(after: wait + 0.5, confirming: true)
+                return
+            }
+        }
+
+        lastDesktopRepair = Date()
+        lastDesktopGeometry = geometry
+        desktopNeedsRedraw = false
+        repairedMisfits = misfits
+
+        let wallpaperRestarted = DesktopPicture.restart(.wallpaper)
+        let dockMisfit = misfits.first { $0.owner == .dock }
+        let dockRestarted = dockMisfit != nil && DesktopPicture.restart(.dock)
+
+        // A routine redraw after a layout change goes unannounced; a picture
+        // that was visibly wrong does not.
+        if let misfit = misfits.first, wallpaperRestarted || dockRestarted {
+            sendNotification(title: "Desktop Picture Fixed",
+                             message: "🖼️ It was drawn for a \(misfit.width)×\(misfit.height) screen and has been redrawn.")
+        }
+    }
+
+    // ---------- UI size ----------
+
+    static func sliderValue(forUISizeStep step: Int) -> Double {
+        let span = Double(UISize.steps.count - 1)
+        return 0.05 + Double(step - UISize.steps.lowerBound) * 0.95 / span
+    }
+
+    static func uiSizeStep(forSliderValue value: Double) -> Int {
+        let span = Double(UISize.steps.count - 1)
+        let step = Int(((value - 0.05) / 0.95 * span).rounded()) + UISize.steps.lowerBound
+        return min(max(step, UISize.steps.lowerBound), UISize.steps.upperBound)
+    }
+
+    func toggleMatchUISize() {
+        matchUISize.toggle()
+        refreshMenu()
+        guard matchUISize else { return }
+        // Sizes change as soon as the menu is gone.
+        statusItem.menu?.cancelTracking()
+        uiSizeMatched.removeAll()
+        uiSizeManual.removeAll()
+        scheduleUISizeMatch(after: 0.3, force: true)
+    }
+
+    func setUISizeStep(_ step: Int) {
+        guard step != uiSizeStep else { return }
+        uiSizeStep = step
+        uiSizeStepChanged = true
+        refreshMenu()
+    }
+
+    /// Debounced like the reconcile, and after it: the built-in panel going
+    /// dark is part of the layout this has to match.
+    func scheduleUISizeMatch(after delay: TimeInterval = 3, force: Bool = false) {
+        guard matchUISize else { return }
+        // A forced pass must not be swallowed by a plain one scheduled later.
+        let forcing = force || uiSizeForcePending
+        uiSizeWorkItem?.cancel()
+        uiSizeForcePending = forcing
+        let item = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            self.uiSizeForcePending = false
+            self.matchUISizes(force: forcing)
+        }
+        uiSizeWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
+    }
+
+    /// The density Apple opens this built-in panel at, from the mode it
+    /// marks as default: Apple sizes that for laptop viewing distance.
+    func builtinDefaultPointsPerInch(_ id: CGDirectDisplayID, widthInches: Double) -> Double {
+        let preferred = allDisplayModes(for: id).first {
+            $0.ioFlags & UInt32(kDisplayModeDefaultFlag) != 0 && $0.pixelWidth > $0.width
+        }
+        return preferred.map { Double($0.width) / widthInches } ?? UISize.builtinFallbackPointsPerInch
+    }
+
+    /// The panel's own pixels: the mode macOS flags as native, else the
+    /// largest plain (not HiDPI) mode it offers for the desktop.
+    func nativePixelSize(_ id: CGDirectDisplayID) -> (width: Int, height: Int)? {
+        let modes = allDisplayModes(for: id)
+        if let native = modes.first(where: { $0.ioFlags & UInt32(kDisplayModeNativeFlag) != 0 }) {
+            return (native.pixelWidth, native.pixelHeight)
+        }
+        return modes.filter { $0.isUsableForDesktopGUI() && $0.pixelWidth == $0.width }
+            .max { $0.width * $0.height < $1.width * $1.height }
+            .map { ($0.width, $0.height) }
+    }
+
+    /// Puts every active display at the size closest to the shared target.
+    /// `force` re-matches displays already matched while active, after the
+    /// switch or the slider moved.
+    func matchUISizes(force: Bool) {
+        guard matchUISize, !isSleeping else { return }
+        guard !isMenuOpen, !isConfirmingRefreshRate else {
+            scheduleUISizeMatch(force: force)
+            return
+        }
+
+        let active = DesktopPicture.activeDisplays()
+        let activeKeys = Set(active.map(displayKey))
+        // A display that went away is matched again when it comes back.
+        uiSizeMatched = uiSizeMatched.filter { activeKeys.contains($0.key) }
+
+        for id in active {
+            let key = displayKey(id)
+            let isBuiltin = CGDisplayIsBuiltin(id) != 0
+            // A projector or TV whose EDID has no physical size gives nothing
+            // to match against.
+            let millimetres = CGDisplayScreenSize(id)
+            guard millimetres.width > 100 else { continue }
+            let widthInches = Double(millimetres.width) / 25.4
+
+            let modes = ScaleMode.all(for: id)
+            guard let current = ScaleMode.current(for: id, in: modes) else { continue }
+            let base = isBuiltin
+                ? builtinDefaultPointsPerInch(id, widthInches: widthInches)
+                : UISize.externalPointsPerInch
+            guard let native = nativePixelSize(id),
+                  let best = UISize.best(modes: modes,
+                                         current: current,
+                                         native: native,
+                                         widthInches: widthInches,
+                                         target: UISize.target(base: base, step: uiSizeStep),
+                                         isBuiltin: isBuiltin,
+                                         preferredHz: pinnedRefreshRates[key]) else { continue }
+
+            let name = displayName(for: id, isBuiltin: isBuiltin)
+            if !force {
+                // Picked by hand earlier: left alone.
+                if uiSizeManual[key] != nil { continue }
+                if let matched = uiSizeMatched[key] {
+                    // Matched while active and changed since: the user chose
+                    // that size in System Settings, so it is kept from now on.
+                    if matched != current.sizeKey {
+                        uiSizeManual[key] = current.sizeKey
+                        sendNotification(title: "UI Size",
+                                         message: "📌 Keeping \(name) at \(current.width)×\(current.height) as picked. Move the UI size slider to match it again.")
+                    }
+                    continue
+                }
+            }
+            uiSizeMatched[key] = best.sizeKey
+            guard best.sizeKey != current.sizeKey else { continue }
+
+            if applyScaleMode(best, to: id) {
+                sendNotification(title: "UI Size",
+                                 message: "📐 \(name) now looks like \(best.width)×\(best.height) (\(Int((Double(best.width) / widthInches).rounded())) points per inch).")
+            } else {
+                // Recorded as is, so a failure is neither retried on every
+                // display change nor mistaken for a size picked by hand.
+                uiSizeMatched[key] = current.sizeKey
+                sendNotification(title: "UI Size Failed",
+                                 message: "⚠️ Could not set \(name) to \(best.width)×\(best.height).",
+                                 isWarning: true)
+            }
+        }
+        refreshMenu()
+    }
+
+    /// Saved permanently, so macOS opens the display at this size on the
+    /// next connect by itself and there is nothing left to change then.
+    func applyScaleMode(_ mode: ScaleMode, to id: CGDirectDisplayID) -> Bool {
+        var config: CGDisplayConfigRef?
+        guard CGBeginDisplayConfiguration(&config) == .success else { return false }
+        guard CGSConfigureDisplayMode(config, id, mode.index) == 0 else {
+            CGCancelDisplayConfiguration(config)
+            return false
+        }
+        guard CGCompleteDisplayConfiguration(config, .permanently) == .success else { return false }
+        desktopNeedsRedraw = true
+        return true
+    }
+
     // ---------- میانبرهای سراسری ----------
 
     // RegisterEventHotKey میانبر را در سطح سیستم رزرو می‌کند و هیچ مجوز
@@ -2466,6 +3428,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         isEnabled = false
         stopMonitoring()
         _ = setInternalEnabled(true)
+        // Sleep must never stay off without the app here to switch it back.
+        stopLidAwakeTimer()
+        if appliedSleepDisabled == true, SleepControl.setSleepDisabled(false) {
+            appliedSleepDisabled = false
+        }
     }
 
     func setupTerminationHandlers() {
@@ -2660,12 +3627,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         guard CGCompleteDisplayConfiguration(config, .permanently) == .success else { return false }
+        desktopNeedsRedraw = true
         sendNotification(title: "Mirroring Off", message: "🪞 Stopped mirroring the internal display.")
         return true
     }
 
+    /// Only a panel that is showing a picture says anything about the level
+    /// the user wants. A switched-off panel's backlight still drifts up with
+    /// ambient light or a wake, and taking that drift for a choice is how the
+    /// restore level crept down to a few percent.
     func captureBrightness() {
-        guard internalDisplayID != 0 else { return }
+        guard internalDisplayID != 0, internalIsShowing(internalDisplayID) else { return }
         var level: Float = 0
         if DisplayServicesGetBrightness(internalDisplayID, &level) == 0 && level > 0.01 {
             savedBrightness = level
@@ -2680,7 +3652,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         var level: Float = 0
         if DisplayServicesGetBrightness(id, &level) == 0 {
             if level <= 0.001 { return true } // از قبل صفر است
-            if level > 0.01 { savedBrightness = level } // ترجیح کاربر را نگه می‌داریم
+            // ترجیح کاربر را فقط وقتی پنل هنوز تصویر دارد نگه می‌داریم؛
+            // نوری که روی پنل خاموش بالا رفته انتخاب کاربر نیست.
+            if level > 0.01, internalIsShowing(id) { savedBrightness = level }
         }
         return DisplayServicesSetBrightness(id, 0.0) == 0
     }
@@ -2710,6 +3684,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         guard CGCompleteDisplayConfiguration(config, .forSession) == .success else { return false }
+        desktopNeedsRedraw = true
 
         if enabled {
             // کف امنیتی تا در صورت خراب بودن مقدار ذخیره‌شده، صفحه سیاه نماند
@@ -2829,6 +3804,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // whatever rate macOS chose; this is the one notification that
             // fires for that whether or not switching is on.
             self?.scheduleRefreshRateEnforcement(after: 2.5)
+            // Unplugging the last monitor has to bring sleep back now, not on
+            // the next timer tick: the lid may already be closed.
+            self?.updateLidAwake()
+            self?.scheduleUISizeMatch()
+            self?.scheduleDesktopPictureChecksAfterLayoutChange()
         }
     }
 
@@ -2843,6 +3823,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func handleWake() {
         isSleeping = false
+        // Displays come back from sleep at whatever rate they like, so a wake
+        // counts as every display appearing again.
+        refreshRatePresentKeys.removeAll()
         resetFailureState()
         // شناسه‌ی مانیتور داخلی بعد از بیداری عوض شده؛ کش را دور می‌ریزیم
         internalDisplayID = 0
@@ -2850,6 +3833,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         resolveInternalDisplay()
         // چند بار در بازه‌های مختلف بررسی می‌کنیم چون مانیتور خارجی ممکن است دیرتر برگردد
         scheduleReconcile(after: 4.0)
+        updateLidAwake()
+        scheduleUISizeMatch(after: 6)
+        scheduleDesktopPictureCheck(after: 8)
     }
 
     func startMonitoring() {
@@ -2894,12 +3880,24 @@ let displayCallback: CGDisplayReconfigurationCallBack = { display, flags, userIn
 
     let monitor = Unmanaged<AppDelegate>.fromOpaque(userInfo).takeUnretainedValue()
     DispatchQueue.main.async {
+        // A monitor unplugged and back before the next pass still counts
+        // as appearing.
+        if flags.contains(.addFlag) {
+            monitor.refreshRatePresentKeys.remove(monitor.displayKey(display))
+        }
         monitor.isSleeping = false
         monitor.internalDisplayID = 0 // شناسه ممکن است عوض شده باشد
         monitor.edidCache.removeAll()
         monitor.resetFailureState()
         monitor.scheduleReconcile(after: 2.0)
+        monitor.scheduleDesktopPictureCheck()
     }
+}
+
+// Runs on the main run loop, where the source was added.
+let powerSourceCallback: IOPowerSourceCallbackType = { context in
+    guard let context = context else { return }
+    Unmanaged<AppDelegate>.fromOpaque(context).takeUnretainedValue().updateLidAwake()
 }
 
 // هندلر رویداد کربن یک تابع C است، پس نباید چیزی را capture کند.
@@ -2931,13 +3929,21 @@ let hotKeyHandler: EventHandlerUPP = { _, event, userInfo in
 // the app's back, and the same refresh picks that up.
 extension AppDelegate: NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
+        isMenuOpen = true
         refreshMenu()
         refreshNotificationAuthorization()
         startMenuRefreshTimer()
     }
 
     func menuDidClose(_ menu: NSMenu) {
+        isMenuOpen = false
         stopMenuRefreshTimer()
+        if uiSizeStepChanged {
+            uiSizeStepChanged = false
+            // Moving the slider asks for every display to follow it again.
+            uiSizeManual.removeAll()
+            scheduleUISizeMatch(after: 0.3, force: true)
+        }
         // A row the cursor was on when the menu closed never sees mouseExited,
         // so it would come back highlighted.
         for row in menuRows { row.resetHover() }
