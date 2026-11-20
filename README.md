@@ -43,6 +43,23 @@ private APIs below may behave differently.
 
 ## Install
 
+### Download
+
+Get the latest `AutoDisplayToggle-<version>.dmg` from
+[Releases](https://github.com/sajad3731/AutoDisplayToggle/releases), open it and
+drag **AutoDisplayToggle** into **Applications**. The build is universal (Intel
+and Apple Silicon).
+
+Release builds are not notarized, so the first launch says macOS cannot verify
+the app. Either open **System Settings → Privacy & Security** and click
+**Open Anyway**, or clear the quarantine flag:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/AutoDisplayToggle.app
+```
+
+### Build from source
+
 ```bash
 git clone https://github.com/sajad3731/auto_display_toggle.git
 cd auto_display_toggle
@@ -356,6 +373,34 @@ means **a future macOS release can break this app without warning.**
   to the remembered **Restore brightness** value (50% on a first run).
 - In clamshell mode the built-in display isn't enumerated at all, so the app
   correctly does nothing.
+
+## Releasing
+
+`release.sh` builds a universal binary (`x86_64` + `arm64`), packs it into
+`build/release/AutoDisplayToggle-<version>.zip` and `.dmg`, and writes their
+`SHA256SUMS`. The version comes from `CFBundleShortVersionString` in
+`Info.plist`, so bump it first.
+
+```bash
+./release.sh
+```
+
+With `--publish` it also creates the GitHub release `v<version>` on the current
+commit and attaches the files. It refuses to run with uncommitted changes or an
+unpushed `HEAD`, so the tag always matches the build. It needs the GitHub CLI.
+
+```bash
+./release.sh --publish
+```
+
+Without a Developer ID the app is signed ad-hoc and users have to clear the
+Gatekeeper warning (see *Download*). With an Apple Developer account, set:
+
+- `DEVELOPER_ID="Developer ID Application: Name (TEAMID)"` to sign with the
+  hardened runtime.
+- `NOTARY_PROFILE=<name>` as well, to notarize and staple the app and the DMG.
+  Store the credentials once with
+  `xcrun notarytool store-credentials <name> --apple-id <id> --team-id <TEAMID>`.
 
 ## License
 
