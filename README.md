@@ -149,6 +149,7 @@ Menu items:
 | **Always use highest rate** | Puts each external display on its best rate whenever it is connected or wakes, skipping any rate you reverted |
 | **Notifications** | Silences the routine announcements. Warnings still come through |
 | **Start at Login** | Registers/unregisters the app as a login item |
+| **Show Logs** | Reveals the error and event log in Finder. See *Logs* below |
 | **Reset Displays (Panic)** | Turns the app off and force-restores the internal display |
 | **Quit** | Restores the internal display, then exits |
 
@@ -291,6 +292,48 @@ Other implementation notes:
   item, `applicationWillTerminate`, and `SIGTERM`/`SIGINT`/`SIGHUP` handlers —
   so killing the process or logging out can't leave the panel dark and
   unreachable.
+
+### Logs
+
+Everything the app does wrong, and the events around it, is logged on this Mac
+only. Nothing is sent anywhere.
+
+- **File:** `~/Library/Logs/AutoDisplayToggle/events.jsonl`, one JSON object
+  per line (`ts`, `level`, `cat`, `msg`, `fields`). It rotates at 2 MB into
+  `events.1.jsonl`, so at most about 4 MB is kept. **Show Logs** in the menu
+  reveals it in Finder.
+- **Unified log:** the same lines, under subsystem `com.user.AutoDisplayToggle`,
+  for Console.app or:
+  ```bash
+  log show --last 1d --info --predicate 'subsystem == "com.user.AutoDisplayToggle"'
+  ```
+
+What gets a line:
+
+- **Errors (`error`):** every failed CoreGraphics, DisplayServices, IOKit,
+  `pmset`, hot key or administrator-prompt call, with its status code; a
+  switching loop that keeps failing; crash reports macOS wrote since the last
+  launch.
+- **Warnings (`warning`):** every warning notification, a run that didn't exit
+  cleanly (crash, force quit, power loss), a panic reset.
+- **Behavior (`info`):** launch (version, macOS, model), exit and its reason,
+  sleep and wake, displays added, removed or mirrored, each built-in switch
+  with how long it took and which attempt it was, the backlight creeping up on
+  a dark panel, refresh rate and UI size changes, Keep/Revert answers, desktop
+  repairs, user actions, and every notification, shown or silenced.
+
+Messages that would repeat on the five-second loop are throttled: inside the
+window they are only counted, and the next line carries `repeats`.
+
+Quick reads:
+
+```bash
+grep '"level":"error"' ~/Library/Logs/AutoDisplayToggle/events.jsonl | tail -20
+```
+
+```bash
+jq -r 'select(.msg == "built-in display switched") | .fields.ms' ~/Library/Logs/AutoDisplayToggle/events.jsonl | sort -n | tail -5
+```
 
 ### Private APIs
 

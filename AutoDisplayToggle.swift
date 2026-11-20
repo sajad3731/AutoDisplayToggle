@@ -5,6 +5,7 @@ import ServiceManagement
 import IOKit.graphics
 import IOKit.ps
 import Carbon.HIToolbox // برای میانبرهای سراسری
+import os
 
 @_silgen_name("CGSConfigureDisplayEnabled")
 func CGSConfigureDisplayEnabled(_ config: CGDisplayConfigRef?, _ display: CGDirectDisplayID, _ enabled: Bool) -> CGError
@@ -55,6 +56,211 @@ enum Preference {
     /// Sizes picked by hand in System Settings, per monitor, which matching
     /// leaves alone until the switch or the slider is touched again.
     static let uiSizeManual = "UISizeManual"
+    /// Set while the app runs and cleared on a clean exit, so a launch can
+    /// tell that the run before it crashed or was killed.
+    static let sessionOpen = "LogSessionOpen"
+}
+
+// MARK: - Log
+
+/// Errors and the events around them, kept on this Mac only, in two places:
+///
+/// - The unified log, under the bundle identifier as subsystem, for Console.app
+///   and `log show`.
+/// - A JSON Lines file in ~/Library/Logs/AutoDisplayToggle, one object per
+///   line, which survives reboots and can be read back without any tool.
+///
+/// Writes go through one serial queue, so callers never wait on the disk.
+/// The file is rotated at `maxFileBytes`, keeping one older generation.
+enum Log {
+    enum Level: String {
+        case info, warning, error
+
+        var osLogType: OSLogType {
+            switch self {
+            case .info: return .default
+            case .warning: return .error
+            case .error: return .fault
+            }
+        }
+    }
+
+    enum Category: String {
+        case lifecycle, display, brightness, mirroring, refreshRate, uiSize
+        case override, sleep, desktop, login, hotKey, notification, user
+    }
+
+    static let subsystem = Bundle.main.bundleIdentifier ?? "AutoDisplayToggle"
+    static let directory = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Logs/AutoDisplayToggle", isDirectory: true)
+    static let file = directory.appendingPathComponent("events.jsonl")
+    static let previousFile = directory.appendingPathComponent("events.1.jsonl")
+    static let maxFileBytes: UInt64 = 2_000_000
+
+    private static let queue = DispatchQueue(label: "AutoDisplayToggle.log", qos: .utility)
+    // Touched only on `queue`.
+    nonisolated(unsafe) private static var handle: FileHandle?
+    nonisolated(unsafe) private static var throttled: [String: (last: Date, suppressed: Int)] = [:]
+
+    private static let timestamp: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
+    static func info(_ category: Category, _ message: String, _ fields: [String: Any] = [:],
+                     throttle: TimeInterval? = nil) {
+        write(.info, category, message, fields, throttle: throttle)
+    }
+
+    static func warning(_ category: Category, _ message: String, _ fields: [String: Any] = [:],
+                        throttle: TimeInterval? = nil) {
+        write(.warning, category, message, fields, throttle: throttle)
+    }
+
+    static func error(_ category: Category, _ message: String, _ fields: [String: Any] = [:],
+                      throttle: TimeInterval? = nil) {
+        write(.error, category, message, fields, throttle: throttle)
+    }
+
+    /// `throttle` keeps a message that repeats on a timer from flooding the
+    /// log: within the window, repeats are only counted, and the next one
+    /// written after it carries that count as `repeats`.
+    static func write(_ level: Level, _ category: Category, _ message: String, _ fields: [String: Any],
+                      throttle: TimeInterval?) {
+        let now = Date()
+        queue.async {
+            var fields = fields
+            if let window = throttle {
+                let key = "\(category.rawValue)|\(message)"
+                if let entry = throttled[key], now.timeIntervalSince(entry.last) < window {
+                    throttled[key] = (entry.last, entry.suppressed + 1)
+                    return
+                }
+                if let suppressed = throttled[key]?.suppressed, suppressed > 0 { fields["repeats"] = suppressed }
+                throttled[key] = (now, 0)
+            }
+
+            let detail = fields.keys.sorted().map { "\($0)=\(fields[$0]!)" }.joined(separator: " ")
+            let text = detail.isEmpty ? message : "\(message) \(detail)"
+            Logger(subsystem: subsystem, category: category.rawValue)
+                .log(level: level.osLogType, "\(text, privacy: .public)")
+
+            var record: [String: Any] = ["ts": timestamp.string(from: now),
+                                         "level": level.rawValue,
+                                         "cat": category.rawValue,
+                                         "msg": message]
+            if !fields.isEmpty { record["fields"] = jsonSafe(fields) }
+            guard var line = try? JSONSerialization.data(withJSONObject: record, options: [.sortedKeys]) else { return }
+            line.append(0x0A)
+            append(line)
+        }
+    }
+
+    /// Waits for every queued write. Called before the process exits.
+    static func flush() {
+        queue.sync { try? handle?.synchronize() }
+    }
+
+    private static func jsonSafe(_ fields: [String: Any]) -> [String: Any] {
+        fields.mapValues { value in
+            switch value {
+            case let value as Bool: return value
+            case let value as Int: return value
+            case let value as Int32: return Int(value)
+            case let value as UInt32: return Int(value)
+            case let value as Double: return value.isFinite ? value : String(describing: value)
+            case let value as Float: return value.isFinite ? Double(value) : String(describing: value)
+            case let value as String: return value
+            case let value as [String]: return value
+            case let value as [Int]: return value
+            default: return String(describing: value)
+            }
+        }
+    }
+
+    private static func append(_ line: Data) {
+        if handle == nil { open() }
+        guard let handle = handle else { return }
+        do {
+            try handle.seekToEnd()
+            try handle.write(contentsOf: line)
+            if try handle.offset() > maxFileBytes { rotate() }
+        } catch {
+            // The unified log copy still went out; drop the handle and reopen
+            // on the next line, in case the file was deleted underneath.
+            try? handle.close()
+            self.handle = nil
+        }
+    }
+
+    private static func open() {
+        let fm = FileManager.default
+        try? fm.createDirectory(at: directory, withIntermediateDirectories: true)
+        if !fm.fileExists(atPath: file.path) { fm.createFile(atPath: file.path, contents: nil) }
+        handle = try? FileHandle(forWritingTo: file)
+    }
+
+    private static func rotate() {
+        try? handle?.close()
+        handle = nil
+        let fm = FileManager.default
+        try? fm.removeItem(at: previousFile)
+        try? fm.moveItem(at: file, to: previousFile)
+        open()
+    }
+
+    /// One line describing the machine and the run, so every later line can
+    /// be read against it.
+    static func launch() {
+        let bundleInfo = Bundle.main.infoDictionary ?? [:]
+        var model = [CChar](repeating: 0, count: 256)
+        var size = model.count
+        let hasModel = sysctlbyname("hw.model", &model, &size, nil, 0) == 0
+        #if arch(arm64)
+        let arch = "arm64"
+        #else
+        let arch = "x86_64"
+        #endif
+        info(.lifecycle, "launched", [
+            "version": bundleInfo["CFBundleShortVersionString"] as? String ?? "unbundled",
+            "macOS": ProcessInfo.processInfo.operatingSystemVersionString,
+            "model": hasModel ? String(cString: model) : "unknown",
+            "arch": arch,
+            "pid": Int(ProcessInfo.processInfo.processIdentifier),
+        ])
+
+        let defaults = UserDefaults.standard
+        if defaults.bool(forKey: Preference.sessionOpen) {
+            warning(.lifecycle, "previous run did not exit cleanly (crash, force quit or power loss)")
+        }
+        defaults.set(true, forKey: Preference.sessionOpen)
+        reportCrashes()
+    }
+
+    static func exited(_ reason: String) {
+        info(.lifecycle, "exiting", ["reason": reason])
+        UserDefaults.standard.set(false, forKey: Preference.sessionOpen)
+        flush()
+    }
+
+    /// macOS keeps its own crash reports. Any new since the last launch are
+    /// pointed to from the log, since a crash can't write anything itself.
+    private static func reportCrashes() {
+        let key = "LogLastCrashScan"
+        let defaults = UserDefaults.standard
+        let since = defaults.object(forKey: key) as? Date ?? .distantPast
+        defaults.set(Date(), forKey: key)
+        let folder = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Logs/DiagnosticReports", isDirectory: true)
+        let reports = (try? FileManager.default.contentsOfDirectory(at: folder,
+                                                                    includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
+        for url in reports where url.lastPathComponent.hasPrefix("AutoDisplayToggle") {
+            guard let modified = try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate,
+                  modified > since else { continue }
+            error(.lifecycle, "crash report found", ["path": url.path, "date": timestamp.string(from: modified)])
+        }
+    }
 }
 
 // شناسه‌های میانبرها. امضا فقط باید برای این برنامه یکتا باشد.
@@ -964,8 +1170,13 @@ enum DisplayOverride {
         let folder = support.appendingPathComponent("AutoDisplayToggle/OverrideBackups", isDirectory: true)
         let backup = folder.appendingPathComponent("DisplayVendorID-\(String(vendor, radix: 16))-DisplayProductID-\(String(product, radix: 16)).plist")
         guard !fm.fileExists(atPath: backup.path) else { return }
-        try? fm.createDirectory(at: folder, withIntermediateDirectories: true)
-        try? fm.copyItem(atPath: source, toPath: backup.path)
+        do {
+            try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+            try fm.copyItem(atPath: source, toPath: backup.path)
+            Log.info(.override, "override backed up", ["source": source, "backup": backup.path])
+        } catch {
+            Log.error(.override, "override backup failed", ["source": source, "error": error.localizedDescription])
+        }
     }
 
     enum Failure: Error {
@@ -1021,11 +1232,24 @@ enum DisplayOverride {
         }
         let source = "do shell script \"\(escape(command))\" with prompt \"\(escape(prompt))\" with administrator privileges"
         var error: NSDictionary?
-        guard let script = NSAppleScript(source: source) else { throw Failure.failed("Could not prepare the request.") }
+        guard let script = NSAppleScript(source: source) else {
+            Log.error(.override, "privileged script could not be compiled", ["command": command])
+            throw Failure.failed("Could not prepare the request.")
+        }
         script.executeAndReturnError(&error)
-        guard let error = error else { return }
-        if (error[NSAppleScript.errorNumber] as? Int) == -128 { throw Failure.cancelled }
-        throw Failure.failed(error[NSAppleScript.errorMessage] as? String ?? "Unknown error")
+        guard let error = error else {
+            Log.info(.override, "privileged command ran", ["command": command])
+            return
+        }
+        let number = error[NSAppleScript.errorNumber] as? Int
+        let message = error[NSAppleScript.errorMessage] as? String ?? "Unknown error"
+        if number == -128 {
+            Log.info(.override, "administrator prompt cancelled", ["command": command])
+            throw Failure.cancelled
+        }
+        Log.error(.override, "privileged command failed",
+                  ["command": command, "code": number ?? 0, "error": message])
+        throw Failure.failed(message)
     }
 }
 
@@ -1081,18 +1305,36 @@ enum SleepControl {
         process.arguments = arguments
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
-        do { try process.run() } catch { return -1 }
+        do {
+            try process.run()
+        } catch {
+            Log.error(.sleep, "process could not start",
+                      ["path": path, "args": arguments, "error": error.localizedDescription])
+            return -1
+        }
         process.waitUntilExit()
         return process.terminationStatus
     }
 
     static func setSleepDisabled(_ disabled: Bool) -> Bool {
-        run(sudo, ["-n", pmset, "-a", "disablesleep", disabled ? "1" : "0"]) == 0
+        let status = run(sudo, ["-n", pmset, "-a", "disablesleep", disabled ? "1" : "0"])
+        if status == 0 {
+            Log.info(.sleep, disabled ? "system sleep disabled" : "system sleep enabled")
+        } else {
+            Log.error(.sleep, "pmset disablesleep failed", ["value": disabled, "status": status])
+        }
+        return status == 0
     }
 
     @discardableResult
     static func sleepNow() -> Bool {
-        run(sudo, ["-n", pmset, "sleepnow"]) == 0
+        let status = run(sudo, ["-n", pmset, "sleepnow"])
+        if status == 0 {
+            Log.info(.sleep, "sleep requested (lid closed after sleep came back)")
+        } else {
+            Log.error(.sleep, "pmset sleepnow failed", ["status": status])
+        }
+        return status == 0
     }
 
     /// `sudo -l` with a command answers whether that exact command may run,
@@ -1242,8 +1484,15 @@ enum DesktopPicture {
 
     /// The same as `killall`; launchd starts it again at once.
     static func restart(_ owner: Owner) -> Bool {
-        guard let pid = pid(owner) else { return false }
-        return kill(pid, SIGTERM) == 0
+        guard let pid = pid(owner) else {
+            Log.warning(.desktop, "restart skipped, process not running", ["owner": owner.rawValue])
+            return false
+        }
+        guard kill(pid, SIGTERM) == 0 else {
+            Log.error(.desktop, "restart failed", ["owner": owner.rawValue, "errno": Int(errno)])
+            return false
+        }
+        return true
     }
 }
 
@@ -1293,7 +1542,11 @@ struct ScaleMode: Equatable {
 
     static func current(for id: CGDirectDisplayID, in modes: [ScaleMode]) -> ScaleMode? {
         var index: Int32 = -1
-        guard CGSGetCurrentDisplayMode(id, &index) == 0 else { return nil }
+        let status = CGSGetCurrentDisplayMode(id, &index)
+        guard status == 0 else {
+            Log.error(.uiSize, "CGSGetCurrentDisplayMode failed", ["display": id, "code": status], throttle: 300)
+            return nil
+        }
         return modes.first { $0.index == index }
     }
 }
@@ -1537,6 +1790,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var useUserNotifications = false
     var isWatchingDisplays = false
     var hotKeyRefs: [EventHotKeyRef] = []
+    var exitLogged = false
 
     var statusRow: MenuRowView!
     var switchingRow: MenuRowView!
@@ -1705,8 +1959,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let refreshRateDialogLimit: TimeInterval = 120
 
     func applicationDidFinishLaunching(_ aNotification: Notification) {
+        Log.launch()
         loadPreferences()
         resolveInternalDisplay()
+        logDisplays("displays at launch")
         // A lit panel is a better answer than a remembered one, so this runs
         // after the stored level and overwrites it when it can read a real one.
         captureBrightness()
@@ -1837,6 +2093,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         loginRow = MenuRowView(style: .single)
         loginRow.onClick = { [weak self] in self?.toggleLoginItem() }
         menu.addItem(rowItem(loginRow, accessibilityTitle: "Start at Login"))
+
+        let logsRow = MenuRowView(style: .single)
+        logsRow.content = MenuRowContent(symbolNames: ["doc.text.magnifyingglass", "doc.text"],
+                                         title: "Show Logs")
+        logsRow.onClick = { [weak self] in
+            self?.statusItem.menu?.cancelTracking()
+            self?.showLogs()
+        }
+        menu.addItem(rowItem(logsRow, accessibilityTitle: "Show Logs"))
         menu.addItem(NSMenuItem.separator())
 
         // This row used to carry a ⌘R key equivalent, which reconfigured the
@@ -1872,10 +2137,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.menu = menu
         let fixedRows: [MenuRowView] = [statusRow, switchingRow, brightnessRow, pauseHourRow,
                                         pauseUntilChangeRow, resumeRow, notificationsRow, lidAwakeRow, loginRow,
-                                        uiSizeRow, uiSizeSliderRow,
+                                        logsRow, uiSizeRow, uiSizeSliderRow,
                                         panicRow, quitRow, highestRateRow]
         menuRows = fixedRows + displayRows + refreshRateRows
         refreshMenu()
+    }
+
+    /// Reveals the log file in Finder. The display picture is written first,
+    /// so the newest line always says what the screens look like right now.
+    func showLogs() {
+        logDisplays("logs opened")
+        Log.flush()
+        NSWorkspace.shared.activateFileViewerSelecting([Log.file])
     }
 
     func rowItem(_ view: MenuRowView, accessibilityTitle: String) -> NSMenuItem {
@@ -2258,6 +2531,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                                  message: "✅ AutoDisplayToggle will start automatically at login.")
             }
         } catch {
+            Log.error(.login, "login item change failed",
+                      ["status": service.status.rawValue, "error": String(describing: error)])
             sendNotification(title: "Start at Login Failed",
                              message: "⚠️ \(error.localizedDescription)",
                              isWarning: true)
@@ -2275,6 +2550,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // می‌مانند، چون در غیر این صورت هیچ‌چیز نبود که میانبر روشن‌کردن را
     // بشنود.
     func setEnabled(_ enabled: Bool, notify: Bool = true) {
+        Log.info(.user, enabled ? "switching on" : "switching off", ["wasEnabled": isEnabled])
         isEnabled = enabled
         // Touching the switch by hand settles the question, so a pause waiting
         // to undo it later is dropped. beginPause sets its state afterwards.
@@ -2316,6 +2592,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// master switch, so the pause state is recorded after it rather than before.
     func beginPause(_ mode: PauseMode, duration: TimeInterval?) {
         setEnabled(false, notify: false)
+        Log.info(.user, "paused", ["mode": String(describing: mode), "minutes": duration.map { Int($0 / 60) } ?? 0])
 
         pauseMode = mode
         pauseDeadline = duration.map { Date().addingTimeInterval($0) }
@@ -2335,7 +2612,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func resumeNow() {
-        guard pauseMode != nil else { return }
+        guard let mode = pauseMode else { return }
+        Log.info(.user, "pause ended", ["mode": String(describing: mode)])
         setEnabled(true, notify: false)
         sendNotification(title: "AutoDisplayToggle On",
                          message: "⚡️ Pause over, automatic switching is active again.")
@@ -2545,13 +2823,27 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @discardableResult
     func applyDisplayMode(_ mode: CGDisplayMode, to id: CGDirectDisplayID, option: CGConfigureOption) -> Bool {
+        let fields: [String: Any] = ["display": id, "hz": mode.refreshRate, "modeID": mode.ioDisplayModeID,
+                                     "size": "\(mode.width)x\(mode.height)"]
         var config: CGDisplayConfigRef?
-        guard CGBeginDisplayConfiguration(&config) == .success else { return false }
-        guard CGConfigureDisplayWithDisplayMode(config, id, mode, nil) == .success else {
-            CGCancelDisplayConfiguration(config)
+        let begin = CGBeginDisplayConfiguration(&config)
+        guard begin == .success else {
+            Log.error(.refreshRate, "CGBeginDisplayConfiguration failed", fields.merging(["code": begin.rawValue]) { $1 })
             return false
         }
-        return CGCompleteDisplayConfiguration(config, option) == .success
+        let configure = CGConfigureDisplayWithDisplayMode(config, id, mode, nil)
+        guard configure == .success else {
+            CGCancelDisplayConfiguration(config)
+            Log.error(.refreshRate, "CGConfigureDisplayWithDisplayMode failed", fields.merging(["code": configure.rawValue]) { $1 })
+            return false
+        }
+        let complete = CGCompleteDisplayConfiguration(config, option)
+        guard complete == .success else {
+            Log.error(.refreshRate, "CGCompleteDisplayConfiguration failed", fields.merging(["code": complete.rawValue]) { $1 })
+            return false
+        }
+        Log.info(.refreshRate, "mode applied", fields)
+        return true
     }
 
     /// The mode for `hz` at the display's current size, looked up fresh: a mode
@@ -2650,7 +2942,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return true
         }
 
-        switch confirmRefreshRate(label: label, name: name, displayID: displayID, targetModeID: target.ioDisplayModeID) {
+        let answer = confirmRefreshRate(label: label, name: name, displayID: displayID, targetModeID: target.ioDisplayModeID)
+        Log.info(.refreshRate, "trial answered", ["display": name, "hz": label, "answer": String(describing: answer)])
+        switch answer {
         case .keep:
             if let key = verdictKey {
                 trustedRefreshRates.insert(key)
@@ -3151,6 +3445,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // A misfit that survived its own repair is not one a restart fixes.
         let stubborn = misfits.intersection(repairedMisfits)
         if !layoutChanged && !stubborn.isEmpty {
+            Log.warning(.desktop, "misfit survived restart, ignoring until layout changes",
+                        ["misfits": stubborn.map { "\($0.owner.rawValue) \($0.width)x\($0.height)" }.sorted()])
             ignoredMisfits.formUnion(stubborn)
             repairedMisfits.removeAll()
             return
@@ -3182,6 +3478,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let wallpaperRestarted = DesktopPicture.restart(.wallpaper)
         let dockMisfit = misfits.first { $0.owner == .dock }
         let dockRestarted = dockMisfit != nil && DesktopPicture.restart(.dock)
+        Log.info(.desktop, misfits.isEmpty ? "desktop redrawn after layout change" : "desktop repaired", [
+            "layoutChanged": layoutChanged,
+            "misfits": misfits.map { "\($0.owner.rawValue) \($0.width)x\($0.height)" }.sorted(),
+            "wallpaperRestarted": wallpaperRestarted,
+            "dockRestarted": dockRestarted,
+            "layout": geometry,
+        ])
 
         // A routine redraw after a layout change goes unannounced; a picture
         // that was visibly wrong does not.
@@ -3334,14 +3637,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Saved permanently, so macOS opens the display at this size on the
     /// next connect by itself and there is nothing left to change then.
     func applyScaleMode(_ mode: ScaleMode, to id: CGDirectDisplayID) -> Bool {
+        let fields: [String: Any] = ["display": id, "size": mode.sizeKey, "hz": mode.hz, "index": mode.index]
         var config: CGDisplayConfigRef?
-        guard CGBeginDisplayConfiguration(&config) == .success else { return false }
-        guard CGSConfigureDisplayMode(config, id, mode.index) == 0 else {
-            CGCancelDisplayConfiguration(config)
+        let begin = CGBeginDisplayConfiguration(&config)
+        guard begin == .success else {
+            Log.error(.uiSize, "CGBeginDisplayConfiguration failed", fields.merging(["code": begin.rawValue]) { $1 })
             return false
         }
-        guard CGCompleteDisplayConfiguration(config, .permanently) == .success else { return false }
+        let configure = CGSConfigureDisplayMode(config, id, mode.index)
+        guard configure == 0 else {
+            CGCancelDisplayConfiguration(config)
+            Log.error(.uiSize, "CGSConfigureDisplayMode failed", fields.merging(["code": configure]) { $1 })
+            return false
+        }
+        let complete = CGCompleteDisplayConfiguration(config, .permanently)
+        guard complete == .success else {
+            Log.error(.uiSize, "CGCompleteDisplayConfiguration failed", fields.merging(["code": complete.rawValue]) { $1 })
+            return false
+        }
         desktopNeedsRedraw = true
+        Log.info(.uiSize, "size applied", fields)
         return true
     }
 
@@ -3387,12 +3702,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                                          0,
                                          &ref)
 
-        guard status == noErr, let ref = ref else { return false }
+        guard status == noErr, let ref = ref else {
+            Log.error(.hotKey, "RegisterEventHotKey failed", ["id": id, "keyCode": keyCode, "code": Int(status)])
+            return false
+        }
         hotKeyRefs.append(ref)
         return true
     }
 
     func handleHotKey(_ id: UInt32) {
+        Log.info(.hotKey, "hot key pressed", ["key": id == hotKeyIDTurnOff ? "⌃⌥⌘D" : "⌃⌥⌘E"])
         switch id {
         case hotKeyIDTurnOff:
             if isEnabled { setEnabled(false) }
@@ -3405,6 +3724,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // ---------------------------------------------------------
 
     @objc func manualReset() {
+        Log.warning(.user, "panic reset", ["wasEnabled": isEnabled])
         // setEnabled(false) خودش مانیتور داخلی را برمی‌گرداند؛ اطلاع‌رسانی‌اش را
         // خاموش می‌کنیم تا دو نوتیفیکیشن پشت سر هم نیاید.
         if isEnabled { setEnabled(false, notify: false) }
@@ -3414,17 +3734,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func quitApp() {
-        restoreBeforeExit()
+        restoreBeforeExit(reason: "quit")
         NSApplication.shared.terminate(nil)
     }
 
     // اگر برنامه بدون بازگرداندن نور بسته شود، مانیتور داخلی سیاه و خاموش می‌ماند.
     // پس در همه‌ی مسیرهای خروج (منو، Apple Event، SIGTERM) آن را برمی‌گردانیم.
     func applicationWillTerminate(_ aNotification: Notification) {
-        restoreBeforeExit()
+        restoreBeforeExit(reason: "terminate")
     }
 
-    func restoreBeforeExit() {
+    func restoreBeforeExit(reason: String) {
+        // Quit runs this and then terminate runs it again; one exit line is enough.
+        defer {
+            if !exitLogged {
+                exitLogged = true
+                Log.exited(reason)
+            }
+        }
         isEnabled = false
         stopMonitoring()
         _ = setInternalEnabled(true)
@@ -3440,7 +3767,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             signal(sig, SIG_IGN)
             let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
             source.setEventHandler { [weak self] in
-                self?.restoreBeforeExit()
+                self?.restoreBeforeExit(reason: "signal \(sig)")
                 exit(0)
             }
             source.resume()
@@ -3503,6 +3830,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // Warnings ignore the Notifications switch: silencing routine state changes
     // should not also hide a failure the user has to act on.
     func sendNotification(title: String, message: String, isWarning: Bool = false) {
+        // Logged whether or not it is shown: what the user was told is part of
+        // what happened, and silencing notifications must not blank the log.
+        if isWarning {
+            Log.warning(.notification, title, ["message": message])
+        } else {
+            Log.info(.notification, title, ["message": message, "shown": notificationsEnabled])
+        }
         guard notificationsEnabled || isWarning else { return }
 
         guard useUserNotifications else {
@@ -3516,7 +3850,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         content.title = title
         content.body = message
         let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
-        UNUserNotificationCenter.current().add(request, withCompletionHandler: nil)
+        UNUserNotificationCenter.current().add(request) { error in
+            guard let error = error else { return }
+            Log.error(.notification, "notification delivery failed", ["title": title, "error": error.localizedDescription])
+        }
     }
 
     // مسیر جایگزین: بدون بانْدل یا بدون مجوز نوتیفیکیشن
@@ -3527,7 +3864,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let task = Process()
             task.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
             task.arguments = ["-e", "display notification \(safeMessage) with title \(safeTitle)"]
-            try? task.run()
+            do {
+                try task.run()
+            } catch {
+                Log.error(.notification, "osascript notification failed", ["title": title, "error": error.localizedDescription])
+            }
         }
     }
 
@@ -3577,8 +3918,27 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func onlineDisplays() -> [CGDirectDisplayID] {
         var displayCount: UInt32 = 0
         var displays = [CGDirectDisplayID](repeating: 0, count: 16)
-        guard CGGetOnlineDisplayList(16, &displays, &displayCount) == .success else { return [] }
+        let status = CGGetOnlineDisplayList(16, &displays, &displayCount)
+        guard status == .success else {
+            Log.error(.display, "CGGetOnlineDisplayList failed", ["code": status.rawValue], throttle: 60)
+            return []
+        }
         return Array(displays.prefix(Int(displayCount)))
+    }
+
+    /// The display picture a log line is read against: what is connected,
+    /// what is showing, and where.
+    func logDisplays(_ message: String) {
+        let online = onlineDisplays()
+        let builtin = online.first { CGDisplayIsBuiltin($0) != 0 }
+        Log.info(.display, message, [
+            "online": online.count,
+            "externalActive": online.filter { CGDisplayIsBuiltin($0) == 0 && CGDisplayIsActive($0) != 0 }.count,
+            "builtinPresent": builtin != nil,
+            "builtinShowing": builtin.map(internalIsShowing) ?? false,
+            "lidClosed": PowerState.isLidClosed,
+            "layout": DesktopPicture.geometry(),
+        ])
     }
 
     /// The built-in panel still takes part in the desktop: switched on, or in a
@@ -3619,14 +3979,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard !secondaries.isEmpty else { return true }
 
         var config: CGDisplayConfigRef?
-        guard CGBeginDisplayConfiguration(&config) == .success else { return false }
+        let begin = CGBeginDisplayConfiguration(&config)
+        guard begin == .success else {
+            Log.error(.mirroring, "CGBeginDisplayConfiguration failed", ["code": begin.rawValue])
+            return false
+        }
         for id in secondaries {
-            guard CGConfigureDisplayMirrorOfDisplay(config, id, kCGNullDirectDisplay) == .success else {
+            let status = CGConfigureDisplayMirrorOfDisplay(config, id, kCGNullDirectDisplay)
+            guard status == .success else {
                 CGCancelDisplayConfiguration(config)
+                Log.error(.mirroring, "CGConfigureDisplayMirrorOfDisplay failed", ["display": id, "code": status.rawValue])
                 return false
             }
         }
-        guard CGCompleteDisplayConfiguration(config, .permanently) == .success else { return false }
+        let complete = CGCompleteDisplayConfiguration(config, .permanently)
+        guard complete == .success else {
+            Log.error(.mirroring, "CGCompleteDisplayConfiguration failed", ["code": complete.rawValue])
+            return false
+        }
+        Log.info(.mirroring, "mirroring broken", ["secondaries": secondaries.map { Int($0) }])
         desktopNeedsRedraw = true
         sendNotification(title: "Mirroring Off", message: "🪞 Stopped mirroring the internal display.")
         return true
@@ -3650,20 +4021,36 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @discardableResult
     func enforceZeroBrightness(_ id: CGDirectDisplayID) -> Bool {
         var level: Float = 0
-        if DisplayServicesGetBrightness(id, &level) == 0 {
+        let showing = internalIsShowing(id)
+        let read = DisplayServicesGetBrightness(id, &level)
+        if read == 0 {
             if level <= 0.001 { return true } // از قبل صفر است
             // ترجیح کاربر را فقط وقتی پنل هنوز تصویر دارد نگه می‌داریم؛
             // نوری که روی پنل خاموش بالا رفته انتخاب کاربر نیست.
-            if level > 0.01, internalIsShowing(id) { savedBrightness = level }
+            if level > 0.01, showing { savedBrightness = level }
+        } else {
+            Log.error(.brightness, "DisplayServicesGetBrightness failed", ["display": id, "code": read], throttle: 60)
         }
-        return DisplayServicesSetBrightness(id, 0.0) == 0
+        let status = DisplayServicesSetBrightness(id, 0.0)
+        guard status == 0 else {
+            Log.error(.brightness, "DisplayServicesSetBrightness(0) failed", ["display": id, "code": status], throttle: 60)
+            return false
+        }
+        // A panel already switched off whose backlight came back on by itself
+        // (wake, ambient light sensor) is the drift this loop exists for.
+        Log.info(.brightness, showing ? "backlight zeroed before switch-off" : "backlight crept up on a dark panel, zeroed",
+                 ["display": id, "from": read == 0 ? Double(level) : -1], throttle: showing ? nil : 60)
+        return true
     }
 
     // ---------- اعمال وضعیت ----------
 
     func setInternalEnabled(_ enabled: Bool) -> Bool {
         let id = resolveInternalDisplay()
-        guard id != 0 else { return false }
+        guard id != 0 else {
+            Log.warning(.display, "built-in display not found", ["wanted": enabled ? "on" : "off"], throttle: 60)
+            return false
+        }
 
         // قبل از خاموش کردن نور را صفر می‌کنیم تا در لحظه‌ی تغییر، پنل روشن نماند
         if !enabled {
@@ -3675,20 +4062,39 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             guard breakInternalMirroring(id) else { return false }
         }
 
+        let wanted = enabled ? "on" : "off"
         var config: CGDisplayConfigRef?
-        guard CGBeginDisplayConfiguration(&config) == .success else { return false }
-
-        guard CGSConfigureDisplayEnabled(config, id, enabled) == .success else {
-            CGCancelDisplayConfiguration(config)
+        let begin = CGBeginDisplayConfiguration(&config)
+        guard begin == .success else {
+            Log.error(.display, "CGBeginDisplayConfiguration failed", ["wanted": wanted, "code": begin.rawValue])
             return false
         }
 
-        guard CGCompleteDisplayConfiguration(config, .forSession) == .success else { return false }
+        let configure = CGSConfigureDisplayEnabled(config, id, enabled)
+        guard configure == .success else {
+            CGCancelDisplayConfiguration(config)
+            Log.error(.display, "CGSConfigureDisplayEnabled failed",
+                      ["display": id, "wanted": wanted, "code": configure.rawValue])
+            return false
+        }
+
+        let complete = CGCompleteDisplayConfiguration(config, .forSession)
+        guard complete == .success else {
+            Log.error(.display, "CGCompleteDisplayConfiguration failed",
+                      ["display": id, "wanted": wanted, "code": complete.rawValue])
+            return false
+        }
         desktopNeedsRedraw = true
 
         if enabled {
             // کف امنیتی تا در صورت خراب بودن مقدار ذخیره‌شده، صفحه سیاه نماند
-            return DisplayServicesSetBrightness(id, max(savedBrightness, 0.05)) == 0
+            let level = max(savedBrightness, 0.05)
+            let status = DisplayServicesSetBrightness(id, level)
+            guard status == 0 else {
+                Log.error(.brightness, "brightness restore failed", ["display": id, "level": level, "code": status])
+                return false
+            }
+            return true
         }
         return enforceZeroBrightness(id)
     }
@@ -3739,6 +4145,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             guard let last = lastFailureAt, Date().timeIntervalSince(last) >= failureCooldown else {
                 if !reportedGivingUp {
                     reportedGivingUp = true
+                    Log.error(.display, "switching keeps failing, cooling down",
+                              ["failures": failureCount, "cooldownSeconds": Int(failureCooldown), "wanted": desired ? "on" : "off"])
                     sendNotification(title: "Display Toggle Failed",
                                      message: "⚠️ Could not switch the internal display. Retrying shortly.",
                                      isWarning: true)
@@ -3749,8 +4157,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         isApplying = true
+        let started = Date()
         let ok = setInternalEnabled(desired)
         isApplying = false
+        // One line per attempt: how often switching happens, how long it
+        // takes, and how many tries a change needs.
+        let fields: [String: Any] = ["wanted": desired ? "on" : "off",
+                                     "ms": Int(Date().timeIntervalSince(started) * 1000),
+                                     "attempt": failureCount + 1]
+        if ok {
+            Log.info(.display, "built-in display switched", fields)
+        } else {
+            Log.warning(.display, "built-in display switch failed", fields)
+        }
 
         if ok {
             resetFailureState()
@@ -3782,17 +4201,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self?.isSleeping = true
         }
         nc.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
-            self?.handleWake()
+            self?.handleWake(source: "system wake")
         }
         nc.addObserver(forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: .main) { [weak self] _ in
-            self?.handleWake()
+            self?.handleWake(source: "screens wake")
         }
         nc.addObserver(forName: NSWorkspace.sessionDidBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
-            self?.handleWake()
+            self?.handleWake(source: "session active")
         }
 
         // تغییر آرایش مانیتورها (وصل/قطع شدن، تغییر رزولوشن)
         NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.logDisplays("screen parameters changed")
             self?.isSleeping = false
             self?.resetFailureState()
             // The reconcile loop is stopped while paused, so this is the only
@@ -3813,6 +4233,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func handleSleep() {
+        Log.info(.lifecycle, "system will sleep", ["enabled": isEnabled])
         isSleeping = true
         reconcileWorkItem?.cancel()
         guard isEnabled else { return }
@@ -3821,7 +4242,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         lastKnownInternalActive = nil
     }
 
-    func handleWake() {
+    func handleWake(source: String) {
+        Log.info(.lifecycle, "woke", ["source": source])
         isSleeping = false
         // Displays come back from sleep at whatever rate they like, so a wake
         // counts as every display appearing again.
@@ -3879,6 +4301,16 @@ let displayCallback: CGDisplayReconfigurationCallBack = { display, flags, userIn
     if flags.contains(.beginConfigurationFlag) { return }
 
     let monitor = Unmanaged<AppDelegate>.fromOpaque(userInfo).takeUnretainedValue()
+    // Only the flags that mean a display came, went or switched; mode and
+    // origin changes arrive in bursts and the screen-parameters line covers them.
+    let named: [(CGDisplayChangeSummaryFlags, String)] = [(.addFlag, "added"), (.removeFlag, "removed"),
+                                                          (.enabledFlag, "enabled"), (.disabledFlag, "disabled"),
+                                                          (.mirrorFlag, "mirrored"), (.unMirrorFlag, "unmirrored")]
+    let changes = named.filter { flags.contains($0.0) }.map { $0.1 }
+    if !changes.isEmpty {
+        Log.info(.display, "display reconfigured",
+                 ["display": display, "builtin": CGDisplayIsBuiltin(display) != 0, "changes": changes])
+    }
     DispatchQueue.main.async {
         // A monitor unplugged and back before the next pass still counts
         // as appearing.
