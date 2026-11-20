@@ -388,6 +388,8 @@ means **a future macOS release can break this app without warning.**
 With `--publish` it also creates the GitHub release `v<version>` on the current
 commit and attaches the files. It refuses to run with uncommitted changes or an
 unpushed `HEAD`, so the tag always matches the build. It needs the GitHub CLI.
+If `LOCAL_PROXY_URL` is set and `HTTPS_PROXY` is not, `gh` is sent through that
+proxy.
 
 ```bash
 ./release.sh --publish

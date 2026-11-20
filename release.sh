@@ -13,7 +13,21 @@
 #       With DEVELOPER_ID, notarizes and staples both the app and the DMG.
 #       Create the profile once with:
 #       xcrun notarytool store-credentials <name> --apple-id <id> --team-id <TEAMID>
+#
+# Network:
+#   LOCAL_PROXY_URL=http://host:port
+#       When set (and HTTPS_PROXY is not), gh talks to GitHub through it.
 set -euo pipefail
+
+# Only gh goes through the proxy; the build itself never touches the network.
+gh() {
+    if [[ -n "${LOCAL_PROXY_URL:-}" && -z "${HTTPS_PROXY:-}${https_proxy:-}" ]]; then
+        HTTPS_PROXY="$LOCAL_PROXY_URL" HTTP_PROXY="$LOCAL_PROXY_URL" \
+            NO_PROXY="localhost,127.0.0.1,::1" command gh "$@"
+    else
+        command gh "$@"
+    fi
+}
 
 cd "$(dirname "$0")"
 APP_NAME="AutoDisplayToggle"
