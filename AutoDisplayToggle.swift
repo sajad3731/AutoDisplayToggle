@@ -301,6 +301,158 @@ struct MenuRowContent: Equatable {
     var isEnabled = true
 }
 
+/// The switch drawn in a menu row.
+///
+/// A menu's window never becomes key, so NSSwitch always draws its inactive
+/// look there: a grey track whether it is on or off, with only the side of the
+/// knob telling the two apart. This one fills with the accent colour when on,
+/// the way switches look in a focused window and in Control Center.
+///
+/// It is only a picture of the state; the row handles clicks for it.
+final class MenuSwitchView: NSView {
+
+    private(set) var isOn = false
+    var isEnabled = true {
+        didSet { if isEnabled != oldValue { updateLayers(animated: false) } }
+    }
+    /// The row is showing its selection highlight, which is itself accent
+    /// coloured, so an accent track on top of it would disappear.
+    var isHighlighted = false {
+        didSet { if isHighlighted != oldValue { updateLayers(animated: false) } }
+    }
+
+    private let trackLayer = CALayer()
+    private let knobLayer = CALayer()
+
+    /// macOS 26 draws switches with a wider track and a capsule knob.
+    private static var usesCapsuleKnob: Bool {
+        if #available(macOS 26.0, *) { return true }
+        return false
+    }
+
+    static var trackSize: NSSize {
+        usesCapsuleKnob ? NSSize(width: 36, height: 20) : NSSize(width: 32, height: 18)
+    }
+
+    private static let knobInset: CGFloat = 2
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.addSublayer(trackLayer)
+        trackLayer.addSublayer(knobLayer)
+
+        knobLayer.shadowColor = NSColor.black.cgColor
+        knobLayer.shadowOpacity = 0.22
+        knobLayer.shadowRadius = 1.5
+        knobLayer.shadowOffset = CGSize(width: 0, height: -0.5)
+
+        setAccessibilityElement(false)
+
+        // The accent colour can change while the app runs.
+        NotificationCenter.default.addObserver(self,
+                                               selector: #selector(systemColorsChanged),
+                                               name: NSColor.systemColorsDidChangeNotification,
+                                               object: nil)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("MenuSwitchView is only built in code")
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
+
+    override var intrinsicContentSize: NSSize { MenuSwitchView.trackSize }
+    override var wantsUpdateLayer: Bool { true }
+
+    func setOn(_ on: Bool, animated: Bool) {
+        guard on != isOn else { return }
+        isOn = on
+        updateLayers(animated: animated && window != nil && !isHidden)
+    }
+
+    override func updateLayer() {
+        updateLayers(animated: false)
+    }
+
+    override func layout() {
+        super.layout()
+        updateLayers(animated: false)
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateLayers(animated: false)
+    }
+
+    @objc private func systemColorsChanged() {
+        updateLayers(animated: false)
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    /// Dynamic colours only resolve against an appearance at the moment they
+    /// are read, and layers keep a fixed CGColor.
+    private func resolved(_ color: NSColor) -> CGColor {
+        var cgColor = color.cgColor
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            cgColor = color.cgColor
+        }
+        return cgColor
+    }
+
+    private func updateLayers(animated: Bool) {
+        let size = MenuSwitchView.trackSize
+        let inset = MenuSwitchView.knobInset
+        let knobHeight = size.height - inset * 2
+        let knobWidth = MenuSwitchView.usesCapsuleKnob ? (knobHeight * 1.4).rounded() : knobHeight
+
+        let trackColor: NSColor
+        let knobColor: NSColor
+        switch (isOn, isHighlighted) {
+        case (true, false):
+            trackColor = .controlAccentColor
+            knobColor = .white
+        case (true, true):
+            trackColor = .selectedMenuItemTextColor
+            knobColor = .controlAccentColor
+        case (false, false):
+            trackColor = NSColor.labelColor.withAlphaComponent(0.16)
+            knobColor = .white
+        case (false, true):
+            trackColor = NSColor.selectedMenuItemTextColor.withAlphaComponent(0.35)
+            knobColor = .selectedMenuItemTextColor
+        }
+
+        CATransaction.begin()
+        if animated {
+            CATransaction.setAnimationDuration(0.18)
+            CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeOut))
+        } else {
+            CATransaction.setDisableActions(true)
+        }
+
+        trackLayer.frame = CGRect(x: ((bounds.width - size.width) / 2).rounded(),
+                                  y: ((bounds.height - size.height) / 2).rounded(),
+                                  width: size.width,
+                                  height: size.height)
+        trackLayer.cornerRadius = size.height / 2
+        trackLayer.backgroundColor = resolved(trackColor)
+
+        let knobX = isOn ? size.width - inset - knobWidth : inset
+        knobLayer.frame = CGRect(x: knobX, y: inset, width: knobWidth, height: knobHeight)
+        knobLayer.cornerRadius = knobHeight / 2
+        knobLayer.backgroundColor = resolved(knobColor)
+        knobLayer.shadowOpacity = isHighlighted ? 0 : 0.22
+
+        layer?.opacity = isEnabled ? 1 : 0.4
+
+        CATransaction.commit()
+    }
+}
+
 /// One row of the status menu: an icon, a title, an optional second line, an
 /// optional hint and an optional trailing control.
 ///
@@ -347,7 +499,7 @@ final class MenuRowView: NSView {
     private let subtitleField = MenuRowView.makeLabel(font: NSFont.menuFont(ofSize: NSFont.smallSystemFontSize))
     private let hintField = MenuRowView.makeLabel(font: NSFont.menuFont(ofSize: NSFont.smallSystemFontSize))
     private let detailField = MenuRowView.makeLabel(font: NSFont.menuFont(ofSize: 0))
-    private let toggle = NSSwitch()
+    private let toggle = MenuSwitchView()
     private let slider = NSSlider()
 
     private var isHovered = false {
@@ -374,14 +526,11 @@ final class MenuRowView: NSView {
         hintField.alignment = .right
         iconView.imageScaling = .scaleProportionallyUpOrDown
 
-        // The row handles clicks for its whole width (see hitTest), so the
-        // switch is only ever a picture of the state.
-        toggle.controlSize = .small
-        toggle.refusesFirstResponder = true
-
         // The slider is the one control that has to track the mouse itself, so
         // it keeps its own target and hitTest lets events through to it.
         slider.controlSize = .small
+        // Like NSSwitch, a slider in a menu draws its inactive grey fill.
+        slider.trackFillColor = .controlAccentColor
         slider.minValue = 0.05
         slider.maxValue = 1.0
         slider.isContinuous = true
@@ -442,9 +591,11 @@ final class MenuRowView: NSView {
             slider.isHidden = true
             detailField.isHidden = true
         case .toggle(let isOn):
+            // Slide the knob only when the switch was already on screen;
+            // a row that just turned into a switch shows its state at once.
+            toggle.setOn(isOn, animated: !toggle.isHidden)
             toggle.isHidden = false
             slider.isHidden = true
-            toggle.state = isOn ? .on : .off
             detailField.isHidden = true
         case .detail(let text):
             toggle.isHidden = true
@@ -510,6 +661,7 @@ final class MenuRowView: NSView {
         detailField.textColor = secondary
         hintField.textColor = showsHighlight ? secondary : NSColor.tertiaryLabelColor
         iconView.contentTintColor = showsHighlight ? NSColor.selectedMenuItemTextColor : primary
+        toggle.isHighlighted = showsHighlight
     }
 
     /// Makes the slider snap to `count` evenly spaced stops across its range.
@@ -526,11 +678,7 @@ final class MenuRowView: NSView {
 
     // ---------- Layout ----------
 
-    private var toggleSize: NSSize {
-        let size = toggle.intrinsicContentSize
-        guard size.width > 1, size.height > 1 else { return NSSize(width: 38, height: 22) }
-        return size
-    }
+    private var toggleSize: NSSize { MenuSwitchView.trackSize }
 
     /// Width this row needs for its content, so the menu can give every row the
     /// same one.
@@ -666,7 +814,15 @@ final class MenuRowView: NSView {
         super.draw(dirtyRect)
         guard showsHighlight else { return }
         NSColor.selectedContentBackgroundColor.setFill()
-        NSBezierPath(roundedRect: bounds.insetBy(dx: 5, dy: 1), xRadius: 5, yRadius: 5).fill()
+        // macOS 26 menus have rounder corners, and the highlight follows them
+        // so it sits concentric inside the menu.
+        let radius: CGFloat
+        if #available(macOS 26.0, *) {
+            radius = 8
+        } else {
+            radius = 5
+        }
+        NSBezierPath(roundedRect: bounds.insetBy(dx: 5, dy: 1), xRadius: radius, yRadius: radius).fill()
     }
 
     override func updateTrackingAreas() {
