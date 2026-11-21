@@ -316,9 +316,13 @@ Everything the app does wrong, and the events around it, is logged on this Mac
 only. Nothing is sent anywhere.
 
 - **File:** `~/Library/Logs/AutoDisplayToggle/events.jsonl`, one JSON object
-  per line (`ts`, `level`, `cat`, `msg`, `fields`). It rotates at 2 MB into
+  per line (`ts`, `level`, `cat`, `msg`, `fields`). `ts` is local time with
+  its offset (`2026-11-21T17:00:08.123+03:30`), so it lines up with
+  `pmset -g log` and Console without converting. It rotates at 2 MB into
   `events.1.jsonl`, so at most about 4 MB is kept. **Show Logs** in the menu
-  reveals it in Finder.
+  reveals it in Finder and shows how much space both files take. **Clear
+  Logs…** deletes both after asking; the fresh file starts with a
+  `logs cleared` line.
 - **Unified log:** the same lines, under subsystem `com.user.AutoDisplayToggle`,
   for Console.app or:
   ```bash
@@ -332,15 +336,21 @@ What gets a line:
   switching loop that keeps failing; crash reports macOS wrote since the last
   launch.
 - **Warnings (`warning`):** every warning notification, a run that didn't exit
-  cleanly (crash, force quit, power loss), a panic reset.
+  cleanly (crash, force quit, power loss), a panic reset. A run killed during
+  logout, restart or shutdown is logged as such (`info`), not as a crash.
 - **Behavior (`info`):** launch (version, macOS, model), exit and its reason,
   sleep and wake, displays added, removed or mirrored, each built-in switch
-  with how long it took and which attempt it was, the backlight creeping up on
+  with what it was decided from (`was`, `externals`, `lidClosed`), what asked
+  for it (`trigger`), how long it took in total and per step (`steps`), and
+  which attempt it was, passes held back while asleep or right after a wake, the
+  backlight creeping up on
   a dark panel, refresh rate and UI size changes, Keep/Revert answers, desktop
   repairs, user actions, and every notification, shown or silenced.
 
 Messages that would repeat on the five-second loop are throttled: inside the
-window they are only counted, and the next line carries `repeats`.
+window they are only counted, and the next line carries `repeats`. A count still
+waiting when the window ends, or when the app exits, gets a line of its own with
+`repeatsOnly: true`.
 
 Quick reads:
 

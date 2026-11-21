@@ -59,6 +59,14 @@ enum Preference {
     /// Set while the app runs and cleared on a clean exit, so a launch can
     /// tell that the run before it crashed or was killed.
     static let sessionOpen = "LogSessionOpen"
+    /// True while this app holds `disablesleep` on.
+    static let sleepDisabledByApp = "SleepDisabledByApp"
+    /// A refresh rate on trial, with the mode to go back to, saved before the
+    /// switch so a crash or a forced power-off mid-trial is undone at launch.
+    static let pendingRefreshTrial = "PendingRefreshTrial"
+    /// When the session last started ending (logout, restart, shutdown), so
+    /// a run killed on the way out is not reported as a crash.
+    static let poweringOffAt = "LogPoweringOffAt"
 }
 
 // MARK: - Log
@@ -100,11 +108,27 @@ enum Log {
     private static let queue = DispatchQueue(label: "AutoDisplayToggle.log", qos: .utility)
     // Touched only on `queue`.
     nonisolated(unsafe) private static var handle: FileHandle?
-    nonisolated(unsafe) private static var throttled: [String: (last: Date, suppressed: Int)] = [:]
+    nonisolated(unsafe) private static var throttled: [String: ThrottleEntry] = [:]
+    nonisolated(unsafe) private static var drainTimer: DispatchSourceTimer?
 
+    /// A throttled message and how many of its repeats are waiting to be
+    /// counted in the log.
+    private struct ThrottleEntry {
+        var last: Date
+        var suppressed: Int
+        let window: TimeInterval
+        let level: Level
+        let category: Category
+        let message: String
+    }
+
+    /// Local time with its offset, such as 2026-11-21T17:00:08.123+03:30, so a
+    /// line reads against the clock on the wall, pmset and Console without
+    /// converting. Still sorts, and still parses as ISO 8601.
     private static let timestamp: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        formatter.timeZone = .current
         return formatter
     }()
 
@@ -125,7 +149,8 @@ enum Log {
 
     /// `throttle` keeps a message that repeats on a timer from flooding the
     /// log: within the window, repeats are only counted, and the next one
-    /// written after it carries that count as `repeats`.
+    /// written after it carries that count as `repeats`. A count still
+    /// waiting once the window has passed gets a `repeatsOnly` line.
     static func write(_ level: Level, _ category: Category, _ message: String, _ fields: [String: Any],
                       throttle: TimeInterval?) {
         let now = Date()
@@ -133,33 +158,95 @@ enum Log {
             var fields = fields
             if let window = throttle {
                 let key = "\(category.rawValue)|\(message)"
-                if let entry = throttled[key], now.timeIntervalSince(entry.last) < window {
-                    throttled[key] = (entry.last, entry.suppressed + 1)
+                if var entry = throttled[key], now.timeIntervalSince(entry.last) < window {
+                    entry.suppressed += 1
+                    throttled[key] = entry
                     return
                 }
                 if let suppressed = throttled[key]?.suppressed, suppressed > 0 { fields["repeats"] = suppressed }
-                throttled[key] = (now, 0)
+                throttled[key] = ThrottleEntry(last: now, suppressed: 0, window: window,
+                                               level: level, category: category, message: message)
             }
-
-            let detail = fields.keys.sorted().map { "\($0)=\(fields[$0]!)" }.joined(separator: " ")
-            let text = detail.isEmpty ? message : "\(message) \(detail)"
-            Logger(subsystem: subsystem, category: category.rawValue)
-                .log(level: level.osLogType, "\(text, privacy: .public)")
-
-            var record: [String: Any] = ["ts": timestamp.string(from: now),
-                                         "level": level.rawValue,
-                                         "cat": category.rawValue,
-                                         "msg": message]
-            if !fields.isEmpty { record["fields"] = jsonSafe(fields) }
-            guard var line = try? JSONSerialization.data(withJSONObject: record, options: [.sortedKeys]) else { return }
-            line.append(0x0A)
-            append(line)
+            emit(level, category, message, fields, at: now)
         }
     }
 
-    /// Waits for every queued write. Called before the process exits.
+    /// Writes one line to both places. Runs on `queue`.
+    private static func emit(_ level: Level, _ category: Category, _ message: String, _ fields: [String: Any],
+                             at now: Date) {
+        let detail = fields.keys.sorted().map { "\($0)=\(fields[$0]!)" }.joined(separator: " ")
+        let text = detail.isEmpty ? message : "\(message) \(detail)"
+        Logger(subsystem: subsystem, category: category.rawValue)
+            .log(level: level.osLogType, "\(text, privacy: .public)")
+
+        var record: [String: Any] = ["ts": timestamp.string(from: now),
+                                     "level": level.rawValue,
+                                     "cat": category.rawValue,
+                                     "msg": message]
+        if !fields.isEmpty { record["fields"] = jsonSafe(fields) }
+        guard var line = try? JSONSerialization.data(withJSONObject: record, options: [.sortedKeys]) else { return }
+        line.append(0x0A)
+        append(line)
+    }
+
+    /// Repeats are otherwise only counted on the next copy of their message,
+    /// so a burst that stops, or a run that ends, would take its count with
+    /// it. Once a message's window has passed, its waiting count gets a line
+    /// of its own; `force` writes every waiting count. Runs on `queue`.
+    private static func drainThrottled(force: Bool) {
+        let now = Date()
+        for (key, entry) in throttled where entry.suppressed > 0 {
+            guard force || now.timeIntervalSince(entry.last) >= entry.window else { continue }
+            emit(entry.level, entry.category, entry.message,
+                 ["repeats": entry.suppressed, "repeatsOnly": true,
+                  "since": timestamp.string(from: entry.last)], at: now)
+            throttled[key]?.suppressed = 0
+            throttled[key]?.last = now
+        }
+    }
+
+    private static func startDrainTimer() {
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + 30, repeating: 30, leeway: .seconds(10))
+        timer.setEventHandler { drainThrottled(force: false) }
+        timer.resume()
+        drainTimer = timer
+    }
+
+    /// The current and the previous file together, after queued writes land.
+    static func totalBytes() -> UInt64 {
+        queue.sync {
+            try? handle?.synchronize()
+            return [file, previousFile].reduce(0) { total, url in
+                let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)??.uint64Value
+                return total + (size ?? 0)
+            }
+        }
+    }
+
+    /// Deletes both files and starts a fresh one, whose first line records
+    /// the wipe. Counts waiting on throttled messages go with the history.
+    /// The unified log copy is macOS's and stays until macOS drops it.
+    static func clear() {
+        queue.sync {
+            throttled.removeAll()
+            try? handle?.close()
+            handle = nil
+            let fm = FileManager.default
+            try? fm.removeItem(at: file)
+            try? fm.removeItem(at: previousFile)
+            open()
+        }
+        info(.lifecycle, "logs cleared")
+    }
+
+    /// Waits for every queued write, waiting repeat counts included. Called
+    /// before the process exits.
     static func flush() {
-        queue.sync { try? handle?.synchronize() }
+        queue.sync {
+            drainThrottled(force: true)
+            try? handle?.synchronize()
+        }
     }
 
     private static func jsonSafe(_ fields: [String: Any]) -> [String: Any] {
@@ -174,6 +261,7 @@ enum Log {
             case let value as String: return value
             case let value as [String]: return value
             case let value as [Int]: return value
+            case let value as [String: Any]: return jsonSafe(value)
             default: return String(describing: value)
             }
         }
@@ -232,10 +320,34 @@ enum Log {
 
         let defaults = UserDefaults.standard
         if defaults.bool(forKey: Preference.sessionOpen) {
-            warning(.lifecycle, "previous run did not exit cleanly (crash, force quit or power loss)")
+            // A shutdown that stalls kills apps without running their exit
+            // handlers. That is not a crash, and saying so sent the last
+            // investigation into the stall reports to find out.
+            if let poweredOff = defaults.object(forKey: Preference.poweringOffAt) as? Date {
+                info(.lifecycle, "previous run ended by shutdown, restart or logout",
+                     ["poweringOffAt": timestamp.string(from: poweredOff)])
+            } else {
+                warning(.lifecycle, "previous run did not exit cleanly (crash, force quit or power loss)")
+            }
         }
         defaults.set(true, forKey: Preference.sessionOpen)
+        defaults.removeObject(forKey: Preference.poweringOffAt)
+        startDrainTimer()
         reportCrashes()
+    }
+
+    /// The session is ending: logout, restart or shutdown. Written to disk at
+    /// once, since what follows may be a kill rather than a clean exit.
+    static func poweringOff() {
+        info(.lifecycle, "system powering off")
+        UserDefaults.standard.set(Date(), forKey: Preference.poweringOffAt)
+        flush()
+    }
+
+    /// A logout that was cancelled leaves the app running; the mark must not
+    /// excuse a crash later in the same run. Any wake clears it.
+    static func sessionContinues() {
+        UserDefaults.standard.removeObject(forKey: Preference.poweringOffAt)
     }
 
     static func exited(_ reason: String) {
@@ -1931,6 +2043,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
     var isSleeping = false
+    /// Display sleep, set from screensDidSleep and cleared only by a wake or a
+    /// sign of the user at the keyboard. Unlike isSleeping, screen-parameter
+    /// changes never clear it: a sleeping monitor drops out of the active list,
+    /// and taking that for an unplug switched the panel on every two seconds
+    /// until wake, where the queued switch finally landed.
+    var screensAsleep = false
+    var screensAsleepSince: Date?
+    var displaysAsleep: Bool { isSleeping || screensAsleep }
+    /// After a wake the external monitor can take a few seconds to come back,
+    /// so the panel is not switched on before this moment.
+    var wakeSettleUntil: Date?
+    let wakeSettleDelay: TimeInterval = 4
+    /// The state the last switch reported success for, until the next pass
+    /// sees it. A switch that reports success without taking effect (as during
+    /// display sleep) counts as a failure, so the backoff applies to it.
+    var pendingSwitch: Bool?
+    /// How long each step of the last setInternalEnabled took, in ms.
+    var lastSwitchSteps: [String: Int] = [:]
     var isApplying = false
     var failureCount = 0
     let maxFailures = 6
@@ -1953,6 +2083,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var brightnessRow: MenuRowView!
     var loginRow: MenuRowView!
     var notificationsRow: MenuRowView!
+    var logsRow: MenuRowView!
     var pauseHourRow: MenuRowView!
     var pauseUntilChangeRow: MenuRowView!
     var resumeRow: MenuRowView!
@@ -1983,7 +2114,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     /// What this app last set `disablesleep` to. Nil while it has not touched
     /// it, so a value somebody else set is left alone.
-    var appliedSleepDisabled: Bool?
+    var appliedSleepDisabled: Bool? {
+        didSet {
+            guard appliedSleepDisabled != oldValue else { return }
+            // Remembered across launches, so a run that dies with sleep off
+            // is undone by the next one even with the switch turned off.
+            UserDefaults.standard.set(appliedSleepDisabled == true, forKey: Preference.sleepDisabledByApp)
+            if appliedSleepDisabled == true { startSleepWatchdog() } else { stopSleepWatchdog() }
+        }
+    }
+    var sleepWatchdogPID: pid_t = 0
     var lidAwakeHeldForBattery = false
     var reportedSleepReleaseFailure = false
     let lidAwakeBatteryFloor = 10
@@ -2258,14 +2398,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         loginRow.onClick = { [weak self] in self?.toggleLoginItem() }
         menu.addItem(rowItem(loginRow, accessibilityTitle: "Start at Login"))
 
-        let logsRow = MenuRowView(style: .single)
-        logsRow.content = MenuRowContent(symbolNames: ["doc.text.magnifyingglass", "doc.text"],
-                                         title: "Show Logs")
+        logsRow = MenuRowView(style: .single)
         logsRow.onClick = { [weak self] in
             self?.statusItem.menu?.cancelTracking()
             self?.showLogs()
         }
         menu.addItem(rowItem(logsRow, accessibilityTitle: "Show Logs"))
+
+        let clearLogsRow = MenuRowView(style: .single)
+        clearLogsRow.content = MenuRowContent(symbolNames: ["trash"],
+                                              title: "Clear Logs…",
+                                              isDestructive: true)
+        clearLogsRow.onClick = { [weak self] in
+            self?.statusItem.menu?.cancelTracking()
+            // After the menu has gone, so the alert is not drawn under it.
+            DispatchQueue.main.async { self?.confirmClearLogs() }
+        }
+        menu.addItem(rowItem(clearLogsRow, accessibilityTitle: "Clear Logs"))
+        renderLogsRow()
         menu.addItem(NSMenuItem.separator())
 
         // This row used to carry a ⌘R key equivalent, which reconfigured the
@@ -2301,7 +2451,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.menu = menu
         let fixedRows: [MenuRowView] = [statusRow, switchingRow, brightnessRow, pauseHourRow,
                                         pauseUntilChangeRow, resumeRow, notificationsRow, lidAwakeRow, loginRow,
-                                        logsRow, uiSizeRow, uiSizeSliderRow,
+                                        logsRow, clearLogsRow, uiSizeRow, uiSizeSliderRow,
                                         panicRow, quitRow, highestRateRow]
         menuRows = fixedRows + displayRows + refreshRateRows
         refreshMenu()
@@ -2313,6 +2463,33 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         logDisplays("logs opened")
         Log.flush()
         NSWorkspace.shared.activateFileViewerSelecting([Log.file])
+    }
+
+    /// Show Logs with the space both files take, read when the menu opens
+    /// rather than on every refresh, which runs on the five-second loop too.
+    func renderLogsRow() {
+        let size = ByteCountFormatter.string(fromByteCount: Int64(Log.totalBytes()), countStyle: .file)
+        logsRow.content = MenuRowContent(symbolNames: ["doc.text.magnifyingglass", "doc.text"],
+                                         title: "Show Logs",
+                                         hint: size)
+    }
+
+    /// Deleting the history cannot be undone, and it is what an investigation
+    /// reads, so it asks first.
+    func confirmClearLogs() {
+        let size = ByteCountFormatter.string(fromByteCount: Int64(Log.totalBytes()), countStyle: .file)
+        let alert = NSAlert()
+        alert.messageText = "Clear the logs?"
+        alert.informativeText = "This deletes events.jsonl and events.1.jsonl (\(size)) for good. "
+            + "The copy in Console is kept by macOS and is not affected."
+        alert.alertStyle = .warning
+        let clear = alert.addButton(withTitle: "Clear")
+        clear.hasDestructiveAction = true
+        alert.addButton(withTitle: "Cancel").keyEquivalent = "\u{1b}"
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        Log.clear()
+        renderLogsRow()
     }
 
     func rowItem(_ view: MenuRowView, accessibilityTitle: String) -> NSMenuItem {
@@ -2439,9 +2616,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         uiSizeStep = min(max(defaults.integer(forKey: Preference.uiSizeStep), UISize.steps.lowerBound),
                          UISize.steps.upperBound)
         stayAwakeLidClosed = defaults.bool(forKey: Preference.stayAwakeLidClosed)
-        // A run that ended without a clean exit can leave sleep off; with the
-        // switch on, that is taken as this app's doing, so it gets undone.
-        if stayAwakeLidClosed, PowerState.isSleepDisabled { appliedSleepDisabled = true }
+        // A run that ended without a clean exit can leave sleep off. With the
+        // switch on, or with the last run having switched it off itself, that
+        // is taken as this app's doing, and the launch's updateLidAwake undoes
+        // it unless it is still wanted.
+        if PowerState.isSleepDisabled,
+           stayAwakeLidClosed || defaults.bool(forKey: Preference.sleepDisabledByApp) {
+            appliedSleepDisabled = true
+        } else if !PowerState.isSleepDisabled {
+            // Already undone, so a later disablesleep is not this app's.
+            defaults.set(false, forKey: Preference.sleepDisabledByApp)
+        }
     }
 
     func render(_ state: MenuState) {
@@ -2721,6 +2906,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         clearPause()
         // هر بار که کاربر دستی دخالت می‌کند، وضعیت داخلی برنامه را از نو می‌سنجیم
         isSleeping = false
+        screensAsleep = false
+        pendingSwitch = nil
         resetFailureState()
         refreshMenu()
 
@@ -2730,7 +2917,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 sendNotification(title: "AutoDisplayToggle On",
                                  message: "⚡️ Automatic display switching is active.")
             }
-            scheduleReconcile(after: 0.5)
+            scheduleReconcile(after: 0.5, reason: "switching turned on")
         } else {
             stopMonitoring()
             _ = setInternalEnabled(true)
@@ -3094,6 +3281,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Written to the display preferences straight away. Making it stick
         // only after Keep would mean a second mode set, and with it a second
         // round of input hunting on the monitors that do that.
+        // Saved before the switch: the trial rate is written permanently, and
+        // a monitor left black by it is exactly when someone holds the power
+        // button. Without this the next login would come back to the same
+        // black monitor, with the built-in panel switched off as well.
+        if confirm {
+            UserDefaults.standard.set(["display": displayKey(displayID),
+                                       "modeID": Int(previous.ioDisplayModeID),
+                                       "hz": label],
+                                      forKey: Preference.pendingRefreshTrial)
+        }
+        defer { if confirm { UserDefaults.standard.removeObject(forKey: Preference.pendingRefreshTrial) } }
+
         guard applyDisplayMode(target, to: displayID, option: .permanently) else {
             sendNotification(title: "Refresh Rate Failed",
                              message: "⚠️ Could not switch \(name) to \(label) Hz.",
@@ -3129,6 +3328,37 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         sendNotification(title: "Refresh Rate Reverted",
                          message: "↩️ \(name) is back at \(RefreshRateInfo.label(previous.refreshRate)) Hz.")
         return false
+    }
+
+    /// Puts back the rate a trial replaced when the trial never got its
+    /// answer, because the app crashed or the Mac was powered off during it.
+    /// Kept for a later look while that monitor is not connected.
+    func revertInterruptedRefreshTrial() {
+        guard !isConfirmingRefreshRate,
+              let trial = UserDefaults.standard.dictionary(forKey: Preference.pendingRefreshTrial) else { return }
+        guard let key = trial["display"] as? String, let modeID = trial["modeID"] as? Int else {
+            UserDefaults.standard.removeObject(forKey: Preference.pendingRefreshTrial)
+            return
+        }
+        guard let id = onlineDisplays().first(where: { CGDisplayIsBuiltin($0) == 0 && displayKey($0) == key }) else {
+            return
+        }
+        UserDefaults.standard.removeObject(forKey: Preference.pendingRefreshTrial)
+        let hz = trial["hz"] as? Int
+        if let hz = hz, let info = refreshRateInfo(id) {
+            // Not offered again by itself: it already failed to get an answer once.
+            rejectedRefreshRates.insert(info.verdictKey(hz))
+            trustedRefreshRates.remove(info.verdictKey(hz))
+        }
+        guard CGDisplayCopyDisplayMode(id)?.ioDisplayModeID != Int32(modeID) else { return }
+        guard let mode = allDisplayModes(for: id).first(where: { $0.ioDisplayModeID == Int32(modeID) }),
+              applyDisplayMode(mode, to: id, option: .permanently) else {
+            Log.error(.refreshRate, "could not revert interrupted trial", ["display": key, "modeID": modeID])
+            return
+        }
+        Log.warning(.refreshRate, "interrupted trial reverted", ["display": key, "hz": hz ?? 0, "modeID": modeID])
+        sendNotification(title: "Refresh Rate Reverted",
+                         message: "↩️ A \(hz.map { "\($0) Hz " } ?? "")trial was cut short, so the previous rate is back.")
     }
 
     func displaySnapshot(_ id: CGDirectDisplayID) -> DisplaySnapshot {
@@ -3240,7 +3470,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// check. Runs whether or not automatic switching is on: the refresh rate
     /// is a separate matter from the built-in panel.
     func enforceRefreshRates(interactive: Bool = false) {
-        guard !isSleeping, !isConfirmingRefreshRate else { return }
+        guard !displaysAsleep else {
+            Log.info(.refreshRate, "rate check skipped while asleep", throttle: 300)
+            return
+        }
+        guard !isConfirmingRefreshRate else { return }
+        // Runs shortly after launch and whenever a display appears, which is
+        // when a monitor left on an unanswered trial rate shows up again.
+        revertInterruptedRefreshTrial()
 
         let infos = surveyRefreshRates(surveyDisplays())
         let present = refreshRatePresentKeys
@@ -3551,6 +3788,52 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         lidAwakeTimer = nil
     }
 
+    /// A crash, a force quit or a kill skips every exit handler, and sleep
+    /// would stay off with nothing left to switch it back: a Mac that never
+    /// sleeps, lid closed, in a bag. While this app holds sleep off, a small
+    /// shell process waits for it to go away and switches sleep back on
+    /// through the same sudoers rule. It runs in its own session so it
+    /// outlives the app's process group, and ignores the signals sent to
+    /// that group on the way out.
+    func startSleepWatchdog() {
+        stopSleepWatchdog()
+        let script = """
+        trap '' HUP INT TERM
+        while /bin/kill -0 "$1" 2>/dev/null; do /bin/sleep 5; done
+        exec \(SleepControl.sudo) -n \(SleepControl.pmset) -a disablesleep 0
+        """
+        var attributes: posix_spawnattr_t?
+        posix_spawnattr_init(&attributes)
+        defer { posix_spawnattr_destroy(&attributes) }
+        posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETSID))
+
+        let arguments = ["/bin/sh", "-c", script, "autodisplaytoggle-sleep-watchdog", String(getpid())]
+        let environment = ["PATH=/usr/bin:/bin:/usr/sbin:/sbin"]
+        var argv = arguments.map { strdup($0) } + [nil]
+        var envp = environment.map { strdup($0) } + [nil]
+        defer {
+            argv.forEach { free($0) }
+            envp.forEach { free($0) }
+        }
+
+        var pid: pid_t = 0
+        let status = posix_spawn(&pid, "/bin/sh", nil, &attributes, &argv, &envp)
+        guard status == 0 else {
+            Log.error(.sleep, "sleep watchdog failed to start", ["code": status])
+            return
+        }
+        sleepWatchdogPID = pid
+        Log.info(.sleep, "sleep watchdog started", ["pid": pid])
+    }
+
+    func stopSleepWatchdog() {
+        guard sleepWatchdogPID > 0 else { return }
+        // It ignores TERM on purpose, so KILL is the way to retire it.
+        kill(sleepWatchdogPID, SIGKILL)
+        waitpid(sleepWatchdogPID, nil, 0)
+        sleepWatchdogPID = 0
+    }
+
     /// Plugging and unplugging the charger, straight from IOPowerSources.
     func setupPowerSourceWatch() {
         let context = Unmanaged.passUnretained(self).toOpaque()
@@ -3593,7 +3876,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Whatever triggers a repair has to show up twice, a few seconds apart,
     /// so a Space switch or a change still in flight never counts.
     func checkDesktopPicture(confirming: Bool) {
-        guard !isSleeping else { return }
+        guard !displaysAsleep else {
+            Log.info(.desktop, "desktop check skipped while asleep", throttle: 300)
+            return
+        }
         // Not under an open menu or a dialog: a restart would close or cover
         // them. Asked again once they are gone.
         guard !isMenuOpen, !isConfirmingRefreshRate else {
@@ -3731,7 +4017,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// `force` re-matches displays already matched while active, after the
     /// switch or the slider moved.
     func matchUISizes(force: Bool) {
-        guard matchUISize, !isSleeping else { return }
+        guard matchUISize else { return }
+        guard !displaysAsleep else {
+            Log.info(.uiSize, "size match skipped while asleep", throttle: 300)
+            return
+        }
         guard !isMenuOpen, !isConfirmingRefreshRate else {
             scheduleUISizeMatch(force: force)
             return
@@ -4216,6 +4506,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // ---------- اعمال وضعیت ----------
 
     func setInternalEnabled(_ enabled: Bool) -> Bool {
+        // Milliseconds per step, read by the caller's log line. A switch-off
+        // took ten seconds every time with nothing saying where they went.
+        var steps: [String: Int] = [:]
+        var lapStart = Date()
+        func lap(_ name: String) {
+            steps[name] = Int(Date().timeIntervalSince(lapStart) * 1000)
+            lapStart = Date()
+        }
+        defer { lastSwitchSteps = steps }
+
         let id = resolveInternalDisplay()
         guard id != 0 else {
             Log.warning(.display, "built-in display not found", ["wanted": enabled ? "on" : "off"], throttle: 60)
@@ -4225,11 +4525,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // قبل از خاموش کردن نور را صفر می‌کنیم تا در لحظه‌ی تغییر، پنل روشن نماند
         if !enabled {
             enforceZeroBrightness(id)
+            lap("zeroBrightness")
             // A panel in a mirror set cannot simply be switched off: as the
             // primary it takes the desktop with it, as a secondary the switch
             // does not stick. Mirroring goes first, in its own transaction,
             // because it is saved permanently and the switch-off is not.
-            guard breakInternalMirroring(id) else { return false }
+            let unmirrored = breakInternalMirroring(id)
+            lap("breakMirroring")
+            guard unmirrored else { return false }
         }
 
         let wanted = enabled ? "on" : "off"
@@ -4241,6 +4544,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let configure = CGSConfigureDisplayEnabled(config, id, enabled)
+        lap("configure")
         guard configure == .success else {
             CGCancelDisplayConfiguration(config)
             Log.error(.display, "CGSConfigureDisplayEnabled failed",
@@ -4249,6 +4553,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let complete = CGCompleteDisplayConfiguration(config, .forSession)
+        lap("complete")
         guard complete == .success else {
             Log.error(.display, "CGCompleteDisplayConfiguration failed",
                       ["display": id, "wanted": wanted, "code": complete.rawValue])
@@ -4260,13 +4565,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // کف امنیتی تا در صورت خراب بودن مقدار ذخیره‌شده، صفحه سیاه نماند
             let level = max(savedBrightness, 0.05)
             let status = DisplayServicesSetBrightness(id, level)
+            lap("restoreBrightness")
             guard status == 0 else {
                 Log.error(.brightness, "brightness restore failed", ["display": id, "level": level, "code": status])
                 return false
             }
             return true
         }
-        return enforceZeroBrightness(id)
+        let zeroed = enforceZeroBrightness(id)
+        lap("finalZeroBrightness")
+        return zeroed
     }
 
     // تنها نقطه‌ی تصمیم‌گیری برنامه: وضعیت واقعی را با وضعیت مطلوب مقایسه می‌کند.
@@ -4278,10 +4586,60 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         reportedGivingUp = false
     }
 
-    @objc func reconcile() {
+    /// A missed wake notification would leave switching stopped for good, and
+    /// someone in front of a dark panel cannot open the menu to clear it.
+    /// Keyboard or mouse input after the screens went to sleep wakes them, so
+    /// it proves they are awake. Hardware input only: posted events do not
+    /// wake a display.
+    func clearStaleScreensAsleep() {
+        guard screensAsleep, let since = screensAsleepSince else { return }
+        let anyInput = CGEventType(rawValue: ~0) ?? .mouseMoved
+        let idle = CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: anyInput)
+        guard idle + 2 < Date().timeIntervalSince(since) else { return }
+        Log.warning(.lifecycle, "input since screens slept but no wake notification, clearing",
+                    ["idleSeconds": Int(idle)])
+        screensAsleep = false
+    }
+
+    /// Nothing at all on screen: the one state the user cannot find a way out
+    /// of by looking.
+    func anyDisplayActive() -> Bool {
+        onlineDisplays().contains { CGDisplayIsActive($0) != 0 }
+    }
+
+    /// Each external display and what it reports: active, asleep, mirrored,
+    /// or none of those. What a switch decision was made from.
+    func externalStates() -> [String] {
+        onlineDisplays().filter { CGDisplayIsBuiltin($0) == 0 }.map { id in
+            var states: [String] = []
+            if CGDisplayIsActive(id) != 0 { states.append("active") }
+            if CGDisplayIsAsleep(id) != 0 { states.append("asleep") }
+            if CGDisplayIsInMirrorSet(id) != 0 { states.append("mirrored") }
+            return "\(id):\(states.isEmpty ? "inactive" : states.joined(separator: "+"))"
+        }
+    }
+
+    @objc func reconcileTick() {
+        reconcile(trigger: "timer")
+    }
+
+    /// `trigger` names what asked for this pass, for the log.
+    func reconcile(trigger: String) {
         // Whatever this pass decides, the menu ends up describing it.
         defer { refreshMenu() }
-        guard isEnabled, !isSleeping, !isApplying else { return }
+        clearStaleScreensAsleep()
+        guard isEnabled else { return }
+        // Written so a quiet stretch in the log says whether nothing happened
+        // or everything was held back.
+        guard !displaysAsleep else {
+            Log.info(.display, "switching held while asleep",
+                     ["reason": screensAsleep ? "screens asleep" : "system asleep", "trigger": trigger], throttle: 300)
+            return
+        }
+        guard !isApplying else {
+            Log.info(.display, "switching held, a switch is in progress", ["trigger": trigger], throttle: 60)
+            return
+        }
 
         let id = resolveInternalDisplay()
         guard id != 0 else { return }
@@ -4302,16 +4660,39 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         lastKnownInternalActive = actual
 
         guard actual != desired else {
+            pendingSwitch = nil
             resetFailureState()
             // وضعیت فعال/غیرفعال درست است، ولی بک‌لایت ممکن است دوباره روشن شده باشد
             if !desired { enforceZeroBrightness(id) }
             return
         }
 
+        // The panel stays dark through sleep now, so right after a wake a
+        // missing monitor is more likely still coming back than unplugged.
+        if desired, let until = wakeSettleUntil, until > Date() {
+            Log.info(.display, "switch-on held until the external display can come back after wake",
+                     ["secondsLeft": Int(until.timeIntervalSinceNow.rounded(.up)), "externals": externalStates(),
+                      "trigger": trigger], throttle: 30)
+            scheduleReconcile(after: until.timeIntervalSinceNow + 0.1, reason: "wake settled")
+            return
+        }
+
+        if pendingSwitch == desired {
+            failureCount += 1
+            lastFailureAt = Date()
+            Log.warning(.display, "switch reported success but did not take effect",
+                        ["wanted": desired ? "on" : "off", "failures": failureCount,
+                         "externals": externalStates(), "trigger": trigger], throttle: 60)
+        }
+        pendingSwitch = nil
+
         // پس از چند شکست پیاپی، به جای دست کشیدن برای همیشه، یک دوره‌ی
         // خنک‌شدن صبر می‌کنیم و دوباره تلاش می‌کنیم؛ وگرنه برنامه تا رویداد
         // بعدی مانیتورها در حالت غلط گیر می‌کرد و باید دستی ری‌استارت می‌شد.
-        if failureCount >= maxFailures {
+        // Switching the panel on when nothing else is showing never waits out
+        // a cooldown: a minute of black screen reads as a dead Mac.
+        let stranded = desired && !anyDisplayActive()
+        if failureCount >= maxFailures && !stranded {
             guard let last = lastFailureAt, Date().timeIntervalSince(last) >= failureCooldown else {
                 if !reportedGivingUp {
                     reportedGivingUp = true
@@ -4326,35 +4707,48 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             failureCount = 0
         }
 
+        // Read before switching: the decision is made from this picture, and
+        // the switch itself changes it.
+        let externals = externalStates()
         isApplying = true
         let started = Date()
         let ok = setInternalEnabled(desired)
         isApplying = false
-        // One line per attempt: how often switching happens, how long it
-        // takes, and how many tries a change needs.
+        // One line per attempt: what it was decided from, what asked for it,
+        // how long each step took, and how many tries a change needs.
         let fields: [String: Any] = ["wanted": desired ? "on" : "off",
+                                     "was": actual ? "on" : "off",
+                                     "externals": externals,
+                                     "lidClosed": PowerState.isLidClosed,
+                                     "stranded": stranded,
+                                     "trigger": trigger,
                                      "ms": Int(Date().timeIntervalSince(started) * 1000),
+                                     "steps": lastSwitchSteps,
                                      "attempt": failureCount + 1]
+        // Retries without a cooldown would otherwise write a line every pass.
+        let throttle: TimeInterval? = failureCount > 0 ? 30 : nil
         if ok {
-            Log.info(.display, "built-in display switched", fields)
+            Log.info(.display, "built-in display switched", fields, throttle: throttle)
         } else {
-            Log.warning(.display, "built-in display switch failed", fields)
+            Log.warning(.display, "built-in display switch failed", fields, throttle: throttle)
         }
 
+        // Success is only confirmed once the next pass sees the new state;
+        // that pass resets the failure count.
         if ok {
-            resetFailureState()
+            pendingSwitch = desired
         } else {
             failureCount += 1
             lastFailureAt = Date()
         }
         // نتیجه در بررسی بعدی تأیید می‌شود
-        scheduleReconcile(after: ok ? 2.0 : 5.0)
+        scheduleReconcile(after: ok ? 2.0 : 5.0, reason: ok ? "verify switch" : "retry switch")
     }
 
     // بررسی با تأخیر و بدون انباشت؛ هر درخواست جدید قبلی را لغو می‌کند
-    func scheduleReconcile(after delay: TimeInterval) {
+    func scheduleReconcile(after delay: TimeInterval, reason: String) {
         reconcileWorkItem?.cancel()
-        let item = DispatchWorkItem { [weak self] in self?.reconcile() }
+        let item = DispatchWorkItem { [weak self] in self?.reconcile(trigger: reason) }
         reconcileWorkItem = item
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
     }
@@ -4368,7 +4762,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self?.handleSleep()
         }
         nc.addObserver(forName: NSWorkspace.screensDidSleepNotification, object: nil, queue: .main) { [weak self] _ in
-            self?.isSleeping = true
+            Log.info(.lifecycle, "screens did sleep")
+            self?.screensAsleep = true
+            self?.screensAsleepSince = Date()
+            self?.reconcileWorkItem?.cancel()
         }
         nc.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
             self?.handleWake(source: "system wake")
@@ -4378,6 +4775,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         nc.addObserver(forName: NSWorkspace.sessionDidBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
             self?.handleWake(source: "session active")
+        }
+        nc.addObserver(forName: NSWorkspace.willPowerOffNotification, object: nil, queue: .main) { _ in
+            Log.poweringOff()
         }
 
         // تغییر آرایش مانیتورها (وصل/قطع شدن، تغییر رزولوشن)
@@ -4390,7 +4790,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // thing watching for the change that ends a display pause.
             self?.checkPause()
             self?.edidCache.removeAll()
-            self?.scheduleReconcile(after: 2.0)
+            self?.scheduleReconcile(after: 2.0, reason: "screen parameters changed")
             // A display that was just attached or woke up comes back at
             // whatever rate macOS chose; this is the one notification that
             // fires for that whether or not switching is on.
@@ -4427,13 +4827,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard isEnabled else { return }
         lastKnownInternalActive = nil
         guard internalPanelOnline() else { return }
-        // قبل از خواب سیستم، مانیتور داخلی را روشن می‌کنیم تا مک‌اواس با حالت عادی بخوابد
+        // With a monitor attached the panel stays off through sleep. Switching
+        // it on here brought every wake back with two screens: the panel lit
+        // up, windows moved onto it, and it went dark again with a Dock
+        // restart. A monitor unplugged during sleep is caught by the reconcile
+        // after wake. With the screens already asleep the monitor reads as
+        // inactive, so that counts as attached too.
+        guard !screensAsleep, !hasActiveExternal() else { return }
         _ = setInternalEnabled(true)
     }
 
     func handleWake(source: String) {
         Log.info(.lifecycle, "woke", ["source": source])
+        Log.sessionContinues()
         isSleeping = false
+        screensAsleep = false
+        pendingSwitch = nil
+        wakeSettleUntil = Date().addingTimeInterval(wakeSettleDelay)
         // Displays come back from sleep at whatever rate they like, so a wake
         // counts as every display appearing again.
         refreshRatePresentKeys.removeAll()
@@ -4443,7 +4853,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         lastKnownInternalActive = nil
         resolveInternalDisplay()
         // چند بار در بازه‌های مختلف بررسی می‌کنیم چون مانیتور خارجی ممکن است دیرتر برگردد
-        scheduleReconcile(after: 4.0)
+        scheduleReconcile(after: wakeSettleDelay, reason: "wake (\(source))")
         updateLidAwake()
         scheduleUISizeMatch(after: 6)
         scheduleDesktopPictureCheck(after: 8)
@@ -4463,12 +4873,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // با Timer.scheduledTimer تایمر یک بار در مود پیش‌فرض ثبت می‌شد و
         // اضافه‌کردن دوباره‌اش به رون‌لوپ ثبت تکراری بود؛ اینجا فقط یک بار و در
         // مودهای common ثبت می‌شود تا هنگام باز بودن منو هم متوقف نشود.
-        let timer = Timer(timeInterval: 5.0, target: self, selector: #selector(reconcile), userInfo: nil, repeats: true)
+        let timer = Timer(timeInterval: 5.0, target: self, selector: #selector(reconcileTick), userInfo: nil, repeats: true)
         timer.tolerance = 2.0
         RunLoop.main.add(timer, forMode: .common)
         reconcileTimer = timer
 
-        scheduleReconcile(after: 1.0)
+        scheduleReconcile(after: 1.0, reason: "monitoring started")
     }
 
     func stopMonitoring() {
@@ -4510,7 +4920,7 @@ let displayCallback: CGDisplayReconfigurationCallBack = { display, flags, userIn
         monitor.internalDisplayID = 0 // شناسه ممکن است عوض شده باشد
         monitor.edidCache.removeAll()
         monitor.resetFailureState()
-        monitor.scheduleReconcile(after: 2.0)
+        monitor.scheduleReconcile(after: 2.0, reason: "display reconfigured")
         monitor.scheduleDesktopPictureCheck()
     }
 }
@@ -4551,6 +4961,14 @@ let hotKeyHandler: EventHandlerUPP = { _, event, userInfo in
 extension AppDelegate: NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         isMenuOpen = true
+        renderLogsRow()
+        // Someone clicking the menu proves the screens are awake, should a
+        // wake notification ever go missing.
+        if screensAsleep {
+            Log.warning(.lifecycle, "screens-asleep flag still set at menu open, clearing")
+            screensAsleep = false
+            scheduleReconcile(after: 0.5, reason: "menu opened")
+        }
         refreshMenu()
         refreshNotificationAuthorization()
         startMenuRefreshTimer()
