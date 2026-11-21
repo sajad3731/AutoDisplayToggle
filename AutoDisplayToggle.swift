@@ -2043,6 +2043,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// The slider moved while the menu was open. Display sizes change once it
     /// closes: resizing the screen under an open menu would close it anyway.
     var uiSizeStepChanged = false
+    /// displayKeys of the active displays at the last screen change.
+    var lastActiveDisplayKeys: Set<String> = []
+    /// A display joined or left since the last size pass. macOS resizes the
+    /// others by itself then (the built-in panel lighting up on lid open
+    /// shrinks the external one for a moment), so a size that differs from
+    /// the matched one is macOS's doing, not a pick in System Settings.
+    var activeDisplaysChangedSinceUISizeMatch = false
     var uiSizeWorkItem: DispatchWorkItem?
     var uiSizeForcePending = false
     var uiSizeRow: MenuRowView!
@@ -2119,6 +2126,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         loadPreferences()
         resolveInternalDisplay()
         logDisplays("displays at launch")
+        lastActiveDisplayKeys = Set(DesktopPicture.activeDisplays().map(displayKey))
         // A lit panel is a better answer than a remembered one, so this runs
         // after the stored level and overwrites it when it can read a real one.
         captureBrightness()
@@ -3733,6 +3741,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let activeKeys = Set(active.map(displayKey))
         // A display that went away is matched again when it comes back.
         uiSizeMatched = uiSizeMatched.filter { activeKeys.contains($0.key) }
+        let layoutChurned = activeDisplaysChangedSinceUISizeMatch
+        activeDisplaysChangedSinceUISizeMatch = false
 
         for id in active {
             let key = displayKey(id)
@@ -3761,7 +3771,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             if !force {
                 // Picked by hand earlier: left alone.
                 if uiSizeManual[key] != nil { continue }
-                if let matched = uiSizeMatched[key] {
+                // After a display joined or left, a changed size is matched
+                // again below instead of being taken for a pick.
+                if let matched = uiSizeMatched[key], !layoutChurned {
                     // Matched while active and changed since: the user chose
                     // that size in System Settings, so it is kept from now on.
                     if matched != current.sizeKey {
@@ -3910,7 +3922,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         isEnabled = false
         stopMonitoring()
-        _ = setInternalEnabled(true)
+        if internalPanelOnline() {
+            _ = setInternalEnabled(true)
+        }
         // Sleep must never stay off without the app here to switch it back.
         stopLidAwakeTimer()
         if appliedSleepDisabled == true, SleepControl.setSleepDisabled(false) {
@@ -4369,6 +4383,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // تغییر آرایش مانیتورها (وصل/قطع شدن، تغییر رزولوشن)
         NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
             self?.logDisplays("screen parameters changed")
+            self?.noteActiveDisplayChange()
             self?.isSleeping = false
             self?.resetFailureState()
             // The reconcile loop is stopped while paused, so this is the only
@@ -4388,14 +4403,32 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Called on every screen change, including the ones in between two size
+    /// passes that the debounce would otherwise hide.
+    func noteActiveDisplayChange() {
+        let keys = Set(DesktopPicture.activeDisplays().map(displayKey))
+        if keys != lastActiveDisplayKeys {
+            lastActiveDisplayKeys = keys
+            activeDisplaysChangedSinceUISizeMatch = true
+        }
+    }
+
+    /// A closed lid takes the built-in panel off the online list. Switching it
+    /// on then fails (CGSConfigureDisplayEnabled 1001), and macOS brings it
+    /// back by itself when the lid opens.
+    func internalPanelOnline() -> Bool {
+        onlineDisplays().contains { CGDisplayIsBuiltin($0) != 0 }
+    }
+
     @objc func handleSleep() {
         Log.info(.lifecycle, "system will sleep", ["enabled": isEnabled])
         isSleeping = true
         reconcileWorkItem?.cancel()
         guard isEnabled else { return }
+        lastKnownInternalActive = nil
+        guard internalPanelOnline() else { return }
         // قبل از خواب سیستم، مانیتور داخلی را روشن می‌کنیم تا مک‌اواس با حالت عادی بخوابد
         _ = setInternalEnabled(true)
-        lastKnownInternalActive = nil
     }
 
     func handleWake(source: String) {
