@@ -305,6 +305,25 @@ Other implementation notes:
 - After six consecutive failed attempts the loop backs off for a minute and
   notifies you, then retries — it never stops permanently, so a transient
   refusal from the window server can't wedge the app until the next relaunch.
+  A switch only counts as done once the next pass sees it, so one that reports
+  success without taking effect backs off too. Switching the panel on when
+  nothing else is on screen never waits out the back-off.
+- Switching off runs in a helper: the app binary started with
+  `--switch-off-builtin <id>`. macOS takes the panel off within a second, but
+  `CGCompleteDisplayConfiguration` then waits ten seconds for an
+  end-of-reconfiguration notice a disable never gets, and in the app that
+  would freeze the menu and the shortcuts. If the helper cannot start, the
+  switch runs in-process; anything that switches the panel on cancels it.
+- While the screens sleep, nothing is switched: a sleeping monitor drops out
+  of the active list and would read as unplugged. Only a wake, opening the
+  menu, or keyboard or mouse input since the screens slept ends that state.
+  With a monitor attached the panel also stays off through system sleep, and
+  after a wake it is not switched on for four seconds, while the monitor comes
+  back.
+- With **Stay awake with lid closed** holding `pmset disablesleep` on, a small
+  watchdog process switches sleep back on if the app dies; the next launch
+  checks too. A refresh rate trial cut short by a crash or a forced power-off
+  is reverted when that monitor shows up again.
 - The internal display is re-enabled on **every** exit path — the Quit menu
   item, `applicationWillTerminate`, and `SIGTERM`/`SIGINT`/`SIGHUP` handlers —
   so killing the process or logging out can't leave the panel dark and

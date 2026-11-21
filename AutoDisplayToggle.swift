@@ -69,6 +69,91 @@ enum Preference {
     static let poweringOffAt = "LogPoweringOffAt"
 }
 
+// MARK: - Switch-off helper
+
+/// This binary started with `--switch-off-builtin <display ID>` switches the
+/// built-in panel off for the session, reports one JSON line on stdout, and
+/// exits, without ever starting the app. The app runs the switch-off this way
+/// because the commit waits ten seconds after a disable (see
+/// AppDelegate.switchOffInBackground), and a helper can wait without anyone
+/// noticing.
+enum SwitchOffHelper {
+    static let flag = "--switch-off-builtin"
+
+    struct Result {
+        var ok = false
+        var steps: [String: Int] = [:]
+        var failedStep: String?
+        var code: Int?
+        var status: Int32
+
+        init(output: Data, status: Int32) {
+            self.status = status
+            guard let object = try? JSONSerialization.jsonObject(with: output) as? [String: Any] else {
+                failedStep = "no report"
+                return
+            }
+            ok = (object["ok"] as? Bool ?? false) && status == 0
+            steps = object["steps"] as? [String: Int] ?? [:]
+            failedStep = object["failed"] as? String
+            code = object["code"] as? Int
+        }
+    }
+
+    static func runIfRequested() {
+        let arguments = CommandLine.arguments
+        guard arguments.count >= 3, arguments[1] == flag else { return }
+        guard let raw = UInt32(arguments[2]) else {
+            report(["ok": false, "failed": "arguments"])
+            exit(2)
+        }
+        exit(run(CGDirectDisplayID(raw)))
+    }
+
+    private static func run(_ id: CGDirectDisplayID) -> Int32 {
+        // Only ever the built-in panel: an external display switched off for
+        // the session is a black screen with nothing to bring it back.
+        guard CGDisplayIsBuiltin(id) != 0 else {
+            report(["ok": false, "failed": "not built-in"])
+            return 2
+        }
+        var steps: [String: Int] = [:]
+        var lapStart = Date()
+        func lap(_ name: String) {
+            steps[name] = Int(Date().timeIntervalSince(lapStart) * 1000)
+            lapStart = Date()
+        }
+
+        var config: CGDisplayConfigRef?
+        let begin = CGBeginDisplayConfiguration(&config)
+        guard begin == .success else {
+            report(["ok": false, "failed": "begin", "code": Int(begin.rawValue)])
+            return 1
+        }
+        let configure = CGSConfigureDisplayEnabled(config, id, false)
+        lap("configure")
+        guard configure == .success else {
+            CGCancelDisplayConfiguration(config)
+            report(["ok": false, "failed": "configure", "code": Int(configure.rawValue), "steps": steps])
+            return 1
+        }
+        let complete = CGCompleteDisplayConfiguration(config, .forSession)
+        lap("complete")
+        guard complete == .success else {
+            report(["ok": false, "failed": "complete", "code": Int(complete.rawValue), "steps": steps])
+            return 1
+        }
+        report(["ok": true, "steps": steps])
+        return 0
+    }
+
+    private static func report(_ object: [String: Any]) {
+        guard var data = try? JSONSerialization.data(withJSONObject: object) else { return }
+        data.append(0x0A)
+        FileHandle.standardOutput.write(data)
+    }
+}
+
 // MARK: - Log
 
 /// Errors and the events around them, kept on this Mac only, in two places:
@@ -2061,6 +2146,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var pendingSwitch: Bool?
     /// How long each step of the last setInternalEnabled took, in ms.
     var lastSwitchSteps: [String: Int] = [:]
+    /// The helper process committing a switch-off, while it runs.
+    var switchOffHelper: Process?
+    var switchOffHelperTimeout: DispatchWorkItem?
+    let switchOffHelperLimit: TimeInterval = 30
     var isApplying = false
     var failureCount = 0
     let maxFailures = 6
@@ -4505,36 +4594,59 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // ---------- اعمال وضعیت ----------
 
-    func setInternalEnabled(_ enabled: Bool) -> Bool {
-        // Milliseconds per step, read by the caller's log line. A switch-off
-        // took ten seconds every time with nothing saying where they went.
-        var steps: [String: Int] = [:]
-        var lapStart = Date()
+    /// Milliseconds per step of one switch, for its log line. A switch-off
+    /// took ten seconds every time with nothing saying where they went.
+    final class StepTimer {
+        private(set) var steps: [String: Int] = [:]
+        private var lapStart = Date()
+
         func lap(_ name: String) {
             steps[name] = Int(Date().timeIntervalSince(lapStart) * 1000)
             lapStart = Date()
         }
-        defer { lastSwitchSteps = steps }
 
+        func merge(_ other: [String: Int]) {
+            steps.merge(other) { $1 }
+            lapStart = Date()
+        }
+    }
+
+    /// Switches synchronously. Used for switching on, which takes half a
+    /// second, and as the fallback when the switch-off helper cannot start.
+    func setInternalEnabled(_ enabled: Bool) -> Bool {
+        // Whatever turns the panel on wins over a switch-off still running.
+        if enabled { cancelSwitchOffHelper() }
+        let timer = StepTimer()
+        defer { lastSwitchSteps = timer.steps }
+        guard let id = prepareSwitch(enabled, timer) else { return false }
+        guard commitSwitch(enabled, id: id, timer) else { return false }
+        return settleSwitch(enabled, id: id, timer)
+    }
+
+    /// The fast part before the commit. Nil when there is nothing to switch.
+    func prepareSwitch(_ enabled: Bool, _ timer: StepTimer) -> CGDirectDisplayID? {
         let id = resolveInternalDisplay()
         guard id != 0 else {
             Log.warning(.display, "built-in display not found", ["wanted": enabled ? "on" : "off"], throttle: 60)
-            return false
+            return nil
         }
-
         // قبل از خاموش کردن نور را صفر می‌کنیم تا در لحظه‌ی تغییر، پنل روشن نماند
         if !enabled {
             enforceZeroBrightness(id)
-            lap("zeroBrightness")
+            timer.lap("zeroBrightness")
             // A panel in a mirror set cannot simply be switched off: as the
             // primary it takes the desktop with it, as a secondary the switch
             // does not stick. Mirroring goes first, in its own transaction,
             // because it is saved permanently and the switch-off is not.
             let unmirrored = breakInternalMirroring(id)
-            lap("breakMirroring")
-            guard unmirrored else { return false }
+            timer.lap("breakMirroring")
+            guard unmirrored else { return nil }
         }
+        return id
+    }
 
+    /// The display configuration transaction itself, in this process.
+    func commitSwitch(_ enabled: Bool, id: CGDirectDisplayID, _ timer: StepTimer) -> Bool {
         let wanted = enabled ? "on" : "off"
         var config: CGDisplayConfigRef?
         let begin = CGBeginDisplayConfiguration(&config)
@@ -4544,7 +4656,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let configure = CGSConfigureDisplayEnabled(config, id, enabled)
-        lap("configure")
+        timer.lap("configure")
         guard configure == .success else {
             CGCancelDisplayConfiguration(config)
             Log.error(.display, "CGSConfigureDisplayEnabled failed",
@@ -4553,19 +4665,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let complete = CGCompleteDisplayConfiguration(config, .forSession)
-        lap("complete")
+        timer.lap("complete")
         guard complete == .success else {
             Log.error(.display, "CGCompleteDisplayConfiguration failed",
                       ["display": id, "wanted": wanted, "code": complete.rawValue])
             return false
         }
         desktopNeedsRedraw = true
+        return true
+    }
 
+    /// The backlight after the commit: the saved level when on, zero when off.
+    func settleSwitch(_ enabled: Bool, id: CGDirectDisplayID, _ timer: StepTimer) -> Bool {
         if enabled {
             // کف امنیتی تا در صورت خراب بودن مقدار ذخیره‌شده، صفحه سیاه نماند
             let level = max(savedBrightness, 0.05)
             let status = DisplayServicesSetBrightness(id, level)
-            lap("restoreBrightness")
+            timer.lap("restoreBrightness")
             guard status == 0 else {
                 Log.error(.brightness, "brightness restore failed", ["display": id, "level": level, "code": status])
                 return false
@@ -4573,8 +4689,104 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return true
         }
         let zeroed = enforceZeroBrightness(id)
-        lap("finalZeroBrightness")
+        timer.lap("finalZeroBrightness")
         return zeroed
+    }
+
+    /// Switching off without holding up the app. macOS takes the panel off
+    /// within a second, but CGCompleteDisplayConfiguration then waits ten
+    /// seconds for an end-of-reconfiguration notice that a disable never
+    /// gets, and while it waits the main thread handles no clicks or
+    /// shortcuts. So the transaction runs in a copy of this binary started as
+    /// a helper, and `completion` runs on the main thread once it is done.
+    /// Waiting on another thread instead is not safe: the wait runs the main
+    /// thread's notification handlers on whichever thread is waiting.
+    func switchOffInBackground(completion: @escaping (Bool) -> Void) {
+        let timer = StepTimer()
+        guard let id = prepareSwitch(false, timer) else {
+            lastSwitchSteps = timer.steps
+            completion(false)
+            return
+        }
+        let launched = launchSwitchOffHelper(id: id) { [weak self] result in
+            guard let self = self else { return }
+            timer.merge(result.steps)
+            var ok = result.ok
+            if ok {
+                self.desktopNeedsRedraw = true
+                ok = self.settleSwitch(false, id: id, timer)
+            } else {
+                Log.error(.display, "switch-off helper failed",
+                          ["display": id, "step": result.failedStep ?? "unknown", "code": result.code ?? 0,
+                           "status": result.status])
+            }
+            self.lastSwitchSteps = timer.steps
+            completion(ok)
+        }
+        guard launched else {
+            Log.warning(.display, "switch-off helper did not start, switching in-process")
+            let ok = commitSwitch(false, id: id, timer) && settleSwitch(false, id: id, timer)
+            lastSwitchSteps = timer.steps
+            completion(ok)
+            return
+        }
+        timer.lap("helperStarted")
+    }
+
+    /// Starts the helper. False when it could not be started at all.
+    func launchSwitchOffHelper(id: CGDirectDisplayID,
+                               completion: @escaping (SwitchOffHelper.Result) -> Void) -> Bool {
+        guard let executable = Bundle.main.executableURL else { return false }
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = [SwitchOffHelper.flag, String(id)]
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        process.terminationHandler = { [weak self] finished in
+            // One short JSON line, well under a pipe's buffer, so reading it
+            // only after the exit cannot stall the helper.
+            let data = output.fileHandleForReading.readDataToEndOfFile()
+            let result = SwitchOffHelper.Result(output: data, status: finished.terminationStatus)
+            DispatchQueue.main.async {
+                // A helper cancelled by a switch-on has nobody waiting for it.
+                guard let self = self, self.switchOffHelper === finished else { return }
+                self.switchOffHelper = nil
+                self.switchOffHelperTimeout?.cancel()
+                self.switchOffHelperTimeout = nil
+                completion(result)
+            }
+        }
+        do {
+            try process.run()
+        } catch {
+            Log.error(.display, "switch-off helper failed to launch", ["error": error.localizedDescription])
+            return false
+        }
+        switchOffHelper = process
+        // macOS gives up on its own after ten seconds; a helper still there
+        // long after that is stuck, and ending it reports a failure.
+        let timeout = DispatchWorkItem { [weak process] in
+            guard let process = process, process.isRunning else { return }
+            Log.error(.display, "switch-off helper timed out, ending it", ["pid": Int(process.processIdentifier)])
+            process.terminate()
+        }
+        switchOffHelperTimeout = timeout
+        DispatchQueue.main.asyncAfter(deadline: .now() + switchOffHelperLimit, execute: timeout)
+        return true
+    }
+
+    /// Ends a running switch-off for good. Its transaction either never
+    /// committed, or committed before whatever switches the panel on next.
+    func cancelSwitchOffHelper() {
+        guard let process = switchOffHelper else { return }
+        switchOffHelper = nil
+        switchOffHelperTimeout?.cancel()
+        switchOffHelperTimeout = nil
+        if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+        Log.info(.display, "switch-off helper cancelled", ["pid": Int(process.processIdentifier)])
+        isApplying = false
+        pendingSwitch = nil
     }
 
     // تنها نقطه‌ی تصمیم‌گیری برنامه: وضعیت واقعی را با وضعیت مطلوب مقایسه می‌کند.
@@ -4710,39 +4922,46 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Read before switching: the decision is made from this picture, and
         // the switch itself changes it.
         let externals = externalStates()
-        isApplying = true
         let started = Date()
-        let ok = setInternalEnabled(desired)
-        isApplying = false
-        // One line per attempt: what it was decided from, what asked for it,
-        // how long each step took, and how many tries a change needs.
-        let fields: [String: Any] = ["wanted": desired ? "on" : "off",
-                                     "was": actual ? "on" : "off",
-                                     "externals": externals,
-                                     "lidClosed": PowerState.isLidClosed,
-                                     "stranded": stranded,
-                                     "trigger": trigger,
-                                     "ms": Int(Date().timeIntervalSince(started) * 1000),
-                                     "steps": lastSwitchSteps,
-                                     "attempt": failureCount + 1]
-        // Retries without a cooldown would otherwise write a line every pass.
-        let throttle: TimeInterval? = failureCount > 0 ? 30 : nil
-        if ok {
-            Log.info(.display, "built-in display switched", fields, throttle: throttle)
-        } else {
-            Log.warning(.display, "built-in display switch failed", fields, throttle: throttle)
-        }
+        isApplying = true
+        let finish: (Bool) -> Void = { [weak self] ok in
+            guard let self = self else { return }
+            self.isApplying = false
+            // One line per attempt: what it was decided from, what asked for
+            // it, how long each step took, and how many tries a change needs.
+            let fields: [String: Any] = ["wanted": desired ? "on" : "off",
+                                         "was": actual ? "on" : "off",
+                                         "externals": externals,
+                                         "lidClosed": PowerState.isLidClosed,
+                                         "stranded": stranded,
+                                         "trigger": trigger,
+                                         "ms": Int(Date().timeIntervalSince(started) * 1000),
+                                         "steps": self.lastSwitchSteps,
+                                         "attempt": self.failureCount + 1]
+            // Retries without a cooldown would otherwise write a line every pass.
+            let throttle: TimeInterval? = self.failureCount > 0 ? 30 : nil
+            if ok {
+                Log.info(.display, "built-in display switched", fields, throttle: throttle)
+            } else {
+                Log.warning(.display, "built-in display switch failed", fields, throttle: throttle)
+            }
 
-        // Success is only confirmed once the next pass sees the new state;
-        // that pass resets the failure count.
-        if ok {
-            pendingSwitch = desired
-        } else {
-            failureCount += 1
-            lastFailureAt = Date()
+            // Success is only confirmed once the next pass sees the new state;
+            // that pass resets the failure count.
+            if ok {
+                self.pendingSwitch = desired
+            } else {
+                self.failureCount += 1
+                self.lastFailureAt = Date()
+            }
+            // نتیجه در بررسی بعدی تأیید می‌شود
+            self.scheduleReconcile(after: ok ? 2.0 : 5.0, reason: ok ? "verify switch" : "retry switch")
         }
-        // نتیجه در بررسی بعدی تأیید می‌شود
-        scheduleReconcile(after: ok ? 2.0 : 5.0, reason: ok ? "verify switch" : "retry switch")
+        if desired {
+            finish(setInternalEnabled(true))
+        } else {
+            switchOffInBackground(completion: finish)
+        }
     }
 
     // بررسی با تأخیر و بدون انباشت؛ هر درخواست جدید قبلی را لغو می‌کند
@@ -4997,6 +5216,9 @@ extension AppDelegate: UNUserNotificationCenterDelegate {
         completionHandler([.banner])
     }
 }
+
+// The same binary doubles as the switch-off helper; see SwitchOffHelper.
+SwitchOffHelper.runIfRequested()
 
 let app = NSApplication.shared
 let delegate = AppDelegate()
