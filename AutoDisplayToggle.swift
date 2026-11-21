@@ -46,6 +46,9 @@ enum Preference {
     /// A rate picked by hand, per monitor. It wins over "Always use highest
     /// rate", and is put back whenever the monitor comes back at another one.
     static let pinnedRefreshRates = "PinnedRefreshRates"
+    /// The rate each monitor last ran at while at its intended size, so a
+    /// size change does not keep a rate macOS dropped to for a moment.
+    static let settledRefreshRates = "SettledRefreshRates"
     /// System sleep off while an external display is connected, so the lid
     /// can close on battery too.
     static let stayAwakeLidClosed = "StayAwakeWithLidClosed"
@@ -2279,6 +2282,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// shrinks the external one for a moment), so a size that differs from
     /// the matched one is macOS's doing, not a pick in System Settings.
     var activeDisplaysChangedSinceUISizeMatch = false
+    /// A display joined or left since the desktop was last judged. Comparing
+    /// the layout at two checks misses a display that came and went between
+    /// them: the built-in panel lit for a few seconds leaves the same layout
+    /// behind, with a Dock desktop window freshly drawn at the panel's size.
+    var activeDisplaysChangedSinceDesktopCheck = false
     var uiSizeWorkItem: DispatchWorkItem?
     var uiSizeForcePending = false
     var uiSizeRow: MenuRowView!
@@ -2335,6 +2343,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         didSet {
             guard pinnedRefreshRates != oldValue else { return }
             UserDefaults.standard.set(pinnedRefreshRates, forKey: Preference.pinnedRefreshRates)
+        }
+    }
+    /// displayKey to whole-number Hz, seen while the display sat at the size
+    /// matching intends for it. See Preference.settledRefreshRates.
+    var settledRefreshRates: [String: Int] = [:] {
+        didSet {
+            guard settledRefreshRates != oldValue else { return }
+            UserDefaults.standard.set(settledRefreshRates, forKey: Preference.settledRefreshRates)
         }
     }
     // Reading the EDID walks the IORegistry, too slow for a once-a-second
@@ -2697,6 +2713,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         preferHighestRefreshRate = defaults.bool(forKey: Preference.preferHighestRefreshRate)
         trustedRefreshRates = Set(defaults.stringArray(forKey: Preference.trustedRefreshRates) ?? [])
         rejectedRefreshRates = Set(defaults.stringArray(forKey: Preference.rejectedRefreshRates) ?? [])
+        if let stored = defaults.dictionary(forKey: Preference.settledRefreshRates) {
+            settledRefreshRates = stored.compactMapValues { ($0 as? NSNumber)?.intValue }
+        }
         if let stored = defaults.dictionary(forKey: Preference.pinnedRefreshRates) {
             pinnedRefreshRates = stored.compactMapValues { ($0 as? NSNumber)?.intValue }
         }
@@ -3977,11 +3996,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let geometry = DesktopPicture.geometry()
-        let layoutChanged = lastDesktopGeometry.map { $0 != geometry } ?? false
+        let layoutChanged = (lastDesktopGeometry.map { $0 != geometry } ?? false)
+            || activeDisplaysChangedSinceDesktopCheck
         if layoutChanged { ignoredMisfits.removeAll() }
 
         let misfits = Set(DesktopPicture.misfits()).subtracting(ignoredMisfits)
         // A misfit that survived its own repair is not one a restart fixes.
+        // One that came back after a display joined or left is a new one.
         let stubborn = misfits.intersection(repairedMisfits)
         if !layoutChanged && !stubborn.isEmpty {
             Log.warning(.desktop, "misfit survived restart, ignoring until layout changes",
@@ -3994,6 +4015,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let needsRedraw = layoutChanged || desktopNeedsRedraw
         guard needsRedraw || !misfits.isEmpty else {
             lastDesktopGeometry = geometry
+            activeDisplaysChangedSinceDesktopCheck = false
             repairedMisfits.removeAll()
             return
         }
@@ -4011,6 +4033,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         lastDesktopRepair = Date()
         lastDesktopGeometry = geometry
+        activeDisplaysChangedSinceDesktopCheck = false
         desktopNeedsRedraw = false
         repairedMisfits = misfits
 
@@ -4144,7 +4167,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                                          widthInches: widthInches,
                                          target: UISize.target(base: base, step: uiSizeStep),
                                          isBuiltin: isBuiltin,
-                                         preferredHz: pinnedRefreshRates[key]) else { continue }
+                                         // A rate seen at the intended size beats the current
+                                         // one: when the built-in panel lights up, macOS
+                                         // shrinks the monitor and can drop it to 60 Hz on
+                                         // the way, and matching the size back used to keep
+                                         // that 60 Hz.
+                                         preferredHz: pinnedRefreshRates[key] ?? settledRefreshRates[key])
+            else { continue }
+
+            // At the size it is meant to have, the rate is the real one, set
+            // by macOS on connect or by the user in System Settings.
+            if current.sizeKey == (uiSizeManual[key] ?? best.sizeKey) {
+                settledRefreshRates[key] = current.hz
+            }
 
             let name = displayName(for: id, isBuiltin: isBuiltin)
             if !force {
@@ -4166,7 +4201,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             uiSizeMatched[key] = best.sizeKey
             guard best.sizeKey != current.sizeKey else { continue }
 
-            if applyScaleMode(best, to: id) {
+            let rateSource: String
+            if let pin = pinnedRefreshRates[key], abs(best.hz - pin) <= 1 {
+                rateSource = "pinned"
+            } else if let settled = settledRefreshRates[key], abs(best.hz - settled) <= 1 {
+                rateSource = "settled"
+            } else if best.hz == current.hz {
+                rateSource = "current"
+            } else {
+                rateSource = "highest"
+            }
+            if applyScaleMode(best, to: id, extra: ["fromSize": current.sizeKey, "fromHz": current.hz,
+                                                     "rateSource": rateSource]) {
                 sendNotification(title: "UI Size",
                                  message: "📐 \(name) now looks like \(best.width)×\(best.height) (\(Int((Double(best.width) / widthInches).rounded())) points per inch).")
             } else {
@@ -4183,8 +4229,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Saved permanently, so macOS opens the display at this size on the
     /// next connect by itself and there is nothing left to change then.
-    func applyScaleMode(_ mode: ScaleMode, to id: CGDirectDisplayID) -> Bool {
+    func applyScaleMode(_ mode: ScaleMode, to id: CGDirectDisplayID, extra: [String: Any] = [:]) -> Bool {
         let fields: [String: Any] = ["display": id, "size": mode.sizeKey, "hz": mode.hz, "index": mode.index]
+            .merging(extra) { $1 }
         var config: CGDisplayConfigRef?
         let begin = CGBeginDisplayConfiguration(&config)
         guard begin == .success else {
@@ -5029,6 +5076,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if keys != lastActiveDisplayKeys {
             lastActiveDisplayKeys = keys
             activeDisplaysChangedSinceUISizeMatch = true
+            activeDisplaysChangedSinceDesktopCheck = true
         }
     }
 
