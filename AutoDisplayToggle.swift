@@ -2143,6 +2143,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// so the panel is not switched on before this moment.
     var wakeSettleUntil: Date?
     let wakeSettleDelay: TimeInterval = 4
+    /// The external monitor can come back from sleep with macOS reporting it
+    /// active while it shows no picture, on every display, until the lid is
+    /// opened: with the panel switched off and its backlight at zero through
+    /// the sleep, WindowServer never wakes the external (no "woke on GPU" for
+    /// it in its log). Set when the displays go dark with the panel off and
+    /// the lid open; spent on the first settled pass after the wake.
+    var wakeRefreshDue = false
+    /// When the displays went dark, and whether the whole system slept since.
+    var displaysDarkSince: Date?
+    var systemSleptSinceDark = false
+    /// A screen sleep shorter than this leaves the monitor awake, so nothing
+    /// needs refreshing.
+    let wakeRefreshMinDark: TimeInterval = 5
+    /// While the panel is switched on and off again for a refresh, the two
+    /// changes are not reported as notifications.
+    var wakeRefreshing = false
+    var lastWakeRefreshAt: Date?
+    /// How long the panel stays lit for a refresh before it goes dark again.
+    let wakeRefreshHold: TimeInterval = 1.5
     /// The state the last switch reported success for, until the next pass
     /// sees it. A switch that reports success without taking effect (as during
     /// display sleep) counts as a failure, so the backoff applies to it.
@@ -4050,7 +4069,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // A routine redraw after a layout change goes unannounced; a picture
         // that was visibly wrong does not.
-        if let misfit = misfits.first, wallpaperRestarted || dockRestarted {
+        // A refresh after wake shows the Dock the panel for a moment; the
+        // repair that follows fixes something nobody saw.
+        let afterRefresh = lastWakeRefreshAt.map { Date().timeIntervalSince($0) < 60 } ?? false
+        if let misfit = misfits.first, wallpaperRestarted || dockRestarted, !afterRefresh {
             sendNotification(title: "Desktop Picture Fixed",
                              message: "🖼️ It was drawn for a \(misfit.width)×\(misfit.height) screen and has been redrawn.")
         }
@@ -4850,14 +4872,65 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Keyboard or mouse input after the screens went to sleep wakes them, so
     /// it proves they are awake. Hardware input only: posted events do not
     /// wake a display.
-    func clearStaleScreensAsleep() {
-        guard screensAsleep, let since = screensAsleepSince else { return }
+    ///
+    /// The input usually lands a moment before the wake notification. Taking
+    /// it as the wake itself keeps the settle delay: clearing the flag alone
+    /// let the same pass switch the panel on while the monitor was still
+    /// waking up. True when it was handled as a wake, and the pass that
+    /// called it should leave the rest to the wake's own pass.
+    func clearStaleScreensAsleep() -> Bool {
+        guard screensAsleep, let since = screensAsleepSince else { return false }
         let anyInput = CGEventType(rawValue: ~0) ?? .mouseMoved
         let idle = CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: anyInput)
-        guard idle + 2 < Date().timeIntervalSince(since) else { return }
+        guard idle + 2 < Date().timeIntervalSince(since) else { return false }
         Log.warning(.lifecycle, "input since screens slept but no wake notification, clearing",
-                    ["idleSeconds": Int(idle)])
-        screensAsleep = false
+                    ["idleSeconds": Int(idle), "systemAsleep": isSleeping])
+        // A dark wake reports input too, with the system still asleep; that
+        // one must not count as a wake.
+        guard !isSleeping else {
+            screensAsleep = false
+            return false
+        }
+        handleWake(source: "input")
+        return true
+    }
+
+    /// Called as the displays go dark. Arms the refresh after wake when the
+    /// panel is switched off by this app and could be switched on again.
+    func noteDisplaysGoingDark(system: Bool) {
+        if system { systemSleptSinceDark = true }
+        // Screens first, then the system: the earlier moment counts. Awake
+        // means a new dark spell, whatever a missed wake left behind.
+        if displaysAsleep, displaysDarkSince != nil { return }
+        displaysDarkSince = Date()
+        systemSleptSinceDark = system
+        let panel = onlineDisplays().first { CGDisplayIsBuiltin($0) != 0 }
+        wakeRefreshDue = isEnabled && !PowerState.isLidClosed && panel.map { !internalIsShowing($0) } ?? false
+    }
+
+    /// Switches the panel on with its saved backlight, the way switching it
+    /// on by hand or opening the lid does, and the next pass switches it off
+    /// again as usual. The backlight is the part that matters: WindowServer
+    /// wakes the external display only once the built-in backlight is above
+    /// zero ("Linear brightness after wake" in its log). The same switch-on
+    /// with the backlight held at zero woke only the panel, and the external
+    /// stayed dark until the lid was opened and macOS brought the backlight
+    /// back. So the panel lights up for a moment after such a wake.
+    func refreshDisplaysAfterWake(_ id: CGDirectDisplayID) {
+        wakeRefreshDue = false
+        let externals = externalStates()
+        let started = Date()
+        let ok = setInternalEnabled(true)
+        wakeRefreshing = ok
+        if ok { lastWakeRefreshAt = Date() }
+        let fields: [String: Any] = ["externals": externals, "ok": ok,
+                                     "ms": Int(Date().timeIntervalSince(started) * 1000), "steps": lastSwitchSteps]
+        if ok {
+            Log.info(.display, "displays refreshed after wake", fields)
+        } else {
+            Log.warning(.display, "display refresh after wake failed", fields)
+        }
+        scheduleReconcile(after: ok ? wakeRefreshHold + 0.1 : 2.0, reason: "display refresh")
     }
 
     /// Nothing at all on screen: the one state the user cannot find a way out
@@ -4886,7 +4959,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func reconcile(trigger: String) {
         // Whatever this pass decides, the menu ends up describing it.
         defer { refreshMenu() }
-        clearStaleScreensAsleep()
+        guard !clearStaleScreensAsleep() else { return }
         guard isEnabled else { return }
         // Written so a quiet stretch in the log says whether nothing happened
         // or everything was held back.
@@ -4909,7 +4982,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let desired = !hasActiveExternal()
 
         // اطلاع‌رسانی فقط وقتی وضعیت واقعی عوض شده، نه در هر بار بررسی
-        if let last = lastKnownInternalActive, last != actual {
+        if let last = lastKnownInternalActive, last != actual, !wakeRefreshing {
             if actual {
                 sendNotification(title: "Display Restored", message: "☀️ Internal display is ON.")
             } else {
@@ -4921,8 +4994,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard actual != desired else {
             pendingSwitch = nil
             resetFailureState()
+            wakeRefreshing = false
+            // The external reads active already, so there is nothing to wait
+            // for: every second here is a second of black screens.
+            if !desired && wakeRefreshDue {
+                if internalPanelOnline(), !PowerState.isLidClosed {
+                    refreshDisplaysAfterWake(id)
+                    return
+                }
+                wakeRefreshDue = false
+            }
             // وضعیت فعال/غیرفعال درست است، ولی بک‌لایت ممکن است دوباره روشن شده باشد
             if !desired { enforceZeroBrightness(id) }
+            return
+        }
+
+        // A refresh needs the backlight up for a moment before the panel goes
+        // dark again; a timer pass landing right after it took the panel off
+        // within 11 ms. The refresh's own pass comes once the moment is over.
+        if wakeRefreshing, let refreshed = lastWakeRefreshAt, Date().timeIntervalSince(refreshed) < wakeRefreshHold {
             return
         }
 
@@ -4974,6 +5064,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let finish: (Bool) -> Void = { [weak self] ok in
             guard let self = self else { return }
             self.isApplying = false
+            // A switch reconfigures the displays itself, which is all a
+            // refresh after wake would do.
+            self.wakeRefreshDue = false
             // One line per attempt: what it was decided from, what asked for
             // it, how long each step took, and how many tries a change needs.
             let fields: [String: Any] = ["wanted": desired ? "on" : "off",
@@ -5029,6 +5122,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         nc.addObserver(forName: NSWorkspace.screensDidSleepNotification, object: nil, queue: .main) { [weak self] _ in
             Log.info(.lifecycle, "screens did sleep")
+            self?.noteDisplaysGoingDark(system: false)
             self?.screensAsleep = true
             self?.screensAsleepSince = Date()
             self?.reconcileWorkItem?.cancel()
@@ -5089,6 +5183,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func handleSleep() {
         Log.info(.lifecycle, "system will sleep", ["enabled": isEnabled])
+        // Before the panel may be switched on below: a lit panel needs no
+        // refresh, and that switch-on comes after this.
+        noteDisplaysGoingDark(system: true)
         isSleeping = true
         reconcileWorkItem?.cancel()
         guard isEnabled else { return }
@@ -5107,6 +5204,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func handleWake(source: String) {
         Log.info(.lifecycle, "woke", ["source": source])
         Log.sessionContinues()
+        // System wake and screen wake both arrive; the first one decides.
+        if let since = displaysDarkSince {
+            let dark = Date().timeIntervalSince(since)
+            if wakeRefreshDue && !systemSleptSinceDark && dark < wakeRefreshMinDark {
+                wakeRefreshDue = false
+            }
+            if wakeRefreshDue {
+                Log.info(.display, "display refresh due after wake",
+                         ["darkSeconds": Int(dark), "systemSlept": systemSleptSinceDark])
+            }
+            displaysDarkSince = nil
+            systemSleptSinceDark = false
+        }
         isSleeping = false
         screensAsleep = false
         pendingSwitch = nil
@@ -5120,7 +5230,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         lastKnownInternalActive = nil
         resolveInternalDisplay()
         // چند بار در بازه‌های مختلف بررسی می‌کنیم چون مانیتور خارجی ممکن است دیرتر برگردد
-        scheduleReconcile(after: wakeSettleDelay, reason: "wake (\(source))")
+        // A due refresh goes first: the screens stay black until it runs. A
+        // monitor not back yet by then is still waited for by the settle.
+        scheduleReconcile(after: wakeRefreshDue ? 1.0 : wakeSettleDelay, reason: "wake (\(source))")
         updateLidAwake()
         scheduleUISizeMatch(after: 6)
         scheduleDesktopPictureCheck(after: 8)
