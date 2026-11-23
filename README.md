@@ -30,6 +30,13 @@ and the ambient light sensor will happily brighten a display that is supposed to
 be off. This app therefore treats zero brightness as state to be maintained, not
 a one-time action.
 
+Zero brightness has a price at wake. WindowServer brings the displays back from
+sleep only once the built-in backlight is above zero (its log prints `Linear
+brightness after wake`), so a Mac woken with the lid open and the panel at zero
+stays black on **every** display, the external monitor included, until the lid
+is closed and opened. The app works around it by lighting the panel for a
+moment after such a wake; see *How it works*.
+
 ## Requirements
 
 - macOS 14 or later (developed and tested on macOS 26.7, Intel MacBook Pro)
@@ -317,9 +324,21 @@ Other implementation notes:
 - While the screens sleep, nothing is switched: a sleeping monitor drops out
   of the active list and would read as unplugged. Only a wake, opening the
   menu, or keyboard or mouse input since the screens slept ends that state.
+  Input usually lands a moment before the wake notification, so it counts as
+  the wake itself, except during a dark wake, when the system is still asleep.
   With a monitor attached the panel also stays off through system sleep, and
   after a wake it is not switched on for four seconds, while the monitor comes
   back.
+- **Refresh after wake.** When the displays go dark with the panel switched off
+  and the lid open, a refresh is due on wake: about a second after it, if the
+  external display reads active, the panel is switched on with its saved
+  backlight, held lit for 1.5 seconds, and switched off again by the next pass.
+  Without it every display stays black after the wake (see *What "completely
+  off" means here*); switching the panel on with the backlight held at zero is
+  not enough, and neither is a fresh mode set on the external display. The
+  panel flashes briefly as the price. A screen sleep under five seconds, a
+  closed lid, or a switch already made during the wake skips the refresh, and
+  the two switches it causes send no notifications.
 - With **Stay awake with lid closed** holding `pmset disablesleep` on, a small
   watchdog process switches sleep back on if the app dies; the next launch
   checks too. A refresh rate trial cut short by a crash or a forced power-off
@@ -361,9 +380,10 @@ What gets a line:
   sleep and wake, displays added, removed or mirrored, each built-in switch
   with what it was decided from (`was`, `externals`, `lidClosed`), what asked
   for it (`trigger`), how long it took in total and per step (`steps`), and
-  which attempt it was, passes held back while asleep or right after a wake, the
-  backlight creeping up on
-  a dark panel, refresh rate and UI size changes, Keep/Revert answers, desktop
+  which attempt it was, passes held back while asleep or right after a wake,
+  the refresh after a wake (`display refresh due after wake`, `displays
+  refreshed after wake`), the backlight creeping up on a dark panel, refresh
+  rate and UI size changes, Keep/Revert answers, desktop
   repairs, user actions, and every notification, shown or silenced.
 
 Messages that would repeat on the five-second loop are throttled: inside the
