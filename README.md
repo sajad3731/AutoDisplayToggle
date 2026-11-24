@@ -163,19 +163,24 @@ Menu items:
 | *Status header* | Whether the internal display is lit, and how many external displays are connected |
 | **Automatic switching** | Master switch — see below. The shortcut beside it is the one that does the same thing from the keyboard |
 | **Restore brightness** | The level the internal panel comes back to |
-| **Pause for 1 hour** | Switching off, resuming by itself an hour later |
-| **Pause until displays change** | Switching off until a display is connected or disconnected |
+| **Pause for 1 hour** | Switching off, resuming by itself an hour later. Only shown while switching is on |
+| **Pause until displays change** | Switching off until a display is connected or disconnected. Only shown while switching is on |
 | **Resume now** | Ends a pause early. Only shown while paused, with the time left beside it |
-| *Display list* | Every connected display, built-in first, and whether it is on |
-| *Refresh rate* | Each external display's current rate, then every rate it offers at its current resolution. Picking one asks you to keep it, and reverts by itself otherwise |
+| *Display list* | Every connected display, built-in first, and whether it is on, off or mirrored. A setup with more displays than fit ends in *N more displays* |
+| *Refresh rate* | Each external display's current rate, then every rate it offers at its current resolution, marked *pinned*, *auto skips*, *untested*, *unlocked* or *highest* where it applies. Picking one asks you to keep it, and reverts by itself otherwise |
+| *N Hz unlocked* | A rate unlocked in the display override that macOS has not picked up yet. Says *reconnect display* |
 | **Unlock N Hz…** | Shown when a monitor's EDID allows a higher rate at its native resolution than macOS lists. Adds that rate to its display override |
 | **Remove unlocked rates…** | Takes an unlocked rate back out of the display override |
-| **Always use highest rate** | Puts each external display on its best rate whenever it is connected or wakes, skipping any rate you reverted |
-| **Notifications** | Silences the routine announcements. Warnings still come through |
+| **Always use highest rate** | Puts each external display on its best rate whenever it is connected or wakes, skipping any rate you reverted. Says how many displays a rate you picked by hand keeps lower. Only shown with an external display connected |
+| **Match UI size on all displays** | Sets every display to the resolution that makes text and controls look the same size on each, from its physical size in the EDID. A size you pick in System Settings afterwards is kept for that monitor |
+| **UI size** | Makes the matched size larger or smaller, about 6% per step, three steps each way. Only shown while matching is on, and moving it matches every display again, hand-picked ones included |
+| **Notifications** | Silences the routine announcements. Warnings still come through, which the row says while it is off |
+| **Stay awake with lid closed** | Switches system sleep off while an external display is connected, so the lid can close on battery too. Explains itself and asks for an administrator password the first time, to add a `sudoers` rule for `pmset`. Sleep comes back when the last external display is unplugged or the battery runs low. The row says *sleep off*, *no display* or *low battery* |
 | **Start at Login** | Registers/unregisters the app as a login item |
-| **Show Logs** | Reveals the error and event log in Finder. See *Logs* below |
+| **Show Logs** | Reveals the error and event log in Finder, with the space it takes beside it. See *Logs* below |
+| **Clear Logs…** | Deletes both log files after asking |
 | **Reset Displays (Panic)** | Turns the app off and force-restores the internal display |
-| **Quit** | Restores the internal display, then exits |
+| **Quit AutoDisplayToggle** | Restores the internal display, then exits. <kbd>⌘</kbd><kbd>Q</kbd> while the menu is open |
 
 The switches are real switches and the brightness control is a real slider:
 using one leaves the menu open, so the status header and the display list above
@@ -196,8 +201,9 @@ switches, it does not change the brightness of a display right now — it decide
 where the internal panel lands when it is re-enabled.
 
 Only these are remembered across launches: **Notifications**,
-**Restore brightness**, **Always use highest rate**, and which refresh rates
-you kept or reverted. They live in the app's own `UserDefaults`, so there is
+**Restore brightness**, **Always use highest rate**, which refresh rates you
+kept, reverted or picked by hand, **Stay awake with lid closed**, **Match UI
+size on all displays**, **UI size**, and the sizes you picked by hand. They live in the app's own `UserDefaults`, so there is
 no config file to edit.
 
 Global shortcuts:
