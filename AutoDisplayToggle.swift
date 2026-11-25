@@ -7,31 +7,83 @@ import IOKit.ps
 import Carbon.HIToolbox // برای میانبرهای سراسری
 import os
 
-@_silgen_name("CGSConfigureDisplayEnabled")
-func CGSConfigureDisplayEnabled(_ config: CGDisplayConfigRef?, _ display: CGDirectDisplayID, _ enabled: Bool) -> CGError
+// Private symbols, looked up at run time instead of bound at load time. Bound
+// at load, a symbol a future macOS drops would stop the app from starting at
+// all, with no log line and no way to say why. Looked up, the call fails like
+// any other failed call: logged, retried, and reported.
+enum PrivateAPI {
+    /// dlsym's RTLD_DEFAULT: every image already loaded, CoreGraphics and
+    /// SkyLight included.
+    private static let everywhere = UnsafeMutableRawPointer(bitPattern: -2)
+    private static let displayServices =
+        dlopen("/System/Library/PrivateFrameworks/DisplayServices.framework/DisplayServices", RTLD_LAZY)
 
-// این توابع در سمت C مقدار ۳۲ بیتی برمی‌گردانند؛ اگر Int (۶۴ بیتی) اعلام شوند
-// بیت‌های بالایی نامعتبرند و مقایسه‌ی نتیجه با صفر غیرقابل‌اتکا می‌شود.
-@_silgen_name("DisplayServicesSetBrightness")
-func DisplayServicesSetBrightness(_ display: CGDirectDisplayID, _ brightness: Float) -> Int32
+    private static func symbol<T>(_ name: String, in handle: UnsafeMutableRawPointer?, as type: T.Type) -> T? {
+        guard let handle = handle, let pointer = dlsym(handle, name) else {
+            Log.error(.lifecycle, "private symbol not found", ["symbol": name])
+            return nil
+        }
+        return unsafeBitCast(pointer, to: type)
+    }
 
-@_silgen_name("DisplayServicesGetBrightness")
-func DisplayServicesGetBrightness(_ display: CGDirectDisplayID, _ brightness: UnsafeMutablePointer<Float>) -> Int32
+    typealias ConfigureEnabled = @convention(c) (CGDisplayConfigRef?, CGDirectDisplayID, Bool) -> Int32
+    typealias SetBrightness = @convention(c) (CGDirectDisplayID, Float) -> Int32
+    typealias GetBrightness = @convention(c) (CGDirectDisplayID, UnsafeMutablePointer<Float>) -> Int32
+    typealias ModeCount = @convention(c) (CGDirectDisplayID, UnsafeMutablePointer<Int32>) -> Int32
+    typealias ModeDescription = @convention(c) (CGDirectDisplayID, Int32, UnsafeMutableRawPointer, Int32) -> Int32
+    typealias CurrentMode = @convention(c) (CGDirectDisplayID, UnsafeMutablePointer<Int32>) -> Int32
+    typealias ConfigureMode = @convention(c) (CGDisplayConfigRef?, CGDirectDisplayID, Int32) -> Int32
 
-// The full display mode list, HiDPI sizes included, and the call that sets
-// one by index. See ScaleMode. All return a CGError as a raw 32-bit value.
-@_silgen_name("CGSGetNumberOfDisplayModes")
-func CGSGetNumberOfDisplayModes(_ display: CGDirectDisplayID, _ count: UnsafeMutablePointer<Int32>) -> Int32
+    static let configureEnabled = symbol("CGSConfigureDisplayEnabled", in: everywhere, as: ConfigureEnabled.self)
+    // These return a 32-bit value on the C side; declared as Int (64-bit) the
+    // upper bits would be garbage and comparing the result with zero unreliable.
+    static let setBrightness = symbol("DisplayServicesSetBrightness", in: displayServices, as: SetBrightness.self)
+    static let getBrightness = symbol("DisplayServicesGetBrightness", in: displayServices, as: GetBrightness.self)
+    // The full display mode list, HiDPI sizes included, and the call that sets
+    // one by index. See ScaleMode. All return a CGError as a raw 32-bit value.
+    static let modeCount = symbol("CGSGetNumberOfDisplayModes", in: everywhere, as: ModeCount.self)
+    static let modeDescription = symbol("CGSGetDisplayModeDescriptionOfLength", in: everywhere, as: ModeDescription.self)
+    static let currentMode = symbol("CGSGetCurrentDisplayMode", in: everywhere, as: CurrentMode.self)
+    static let configureMode = symbol("CGSConfigureDisplayMode", in: everywhere, as: ConfigureMode.self)
 
-@_silgen_name("CGSGetDisplayModeDescriptionOfLength")
+    /// What switching the panel needs. Without it the app can only say so.
+    static var canSwitchPanel: Bool {
+        configureEnabled != nil && setBrightness != nil && getBrightness != nil
+    }
+
+    /// Returned by a wrapper whose symbol is missing.
+    static let missing: Int32 = -1
+}
+
+func CGSConfigureDisplayEnabled(_ config: CGDisplayConfigRef?, _ display: CGDirectDisplayID, _ enabled: Bool) -> CGError {
+    guard let call = PrivateAPI.configureEnabled else { return .failure }
+    return CGError(rawValue: call(config, display, enabled)) ?? .failure
+}
+
+func DisplayServicesSetBrightness(_ display: CGDirectDisplayID, _ brightness: Float) -> Int32 {
+    PrivateAPI.setBrightness?(display, brightness) ?? PrivateAPI.missing
+}
+
+func DisplayServicesGetBrightness(_ display: CGDirectDisplayID, _ brightness: UnsafeMutablePointer<Float>) -> Int32 {
+    PrivateAPI.getBrightness?(display, brightness) ?? PrivateAPI.missing
+}
+
+func CGSGetNumberOfDisplayModes(_ display: CGDirectDisplayID, _ count: UnsafeMutablePointer<Int32>) -> Int32 {
+    PrivateAPI.modeCount?(display, count) ?? PrivateAPI.missing
+}
+
 func CGSGetDisplayModeDescriptionOfLength(_ display: CGDirectDisplayID, _ index: Int32,
-                                          _ description: UnsafeMutableRawPointer, _ length: Int32) -> Int32
+                                          _ description: UnsafeMutableRawPointer, _ length: Int32) -> Int32 {
+    PrivateAPI.modeDescription?(display, index, description, length) ?? PrivateAPI.missing
+}
 
-@_silgen_name("CGSGetCurrentDisplayMode")
-func CGSGetCurrentDisplayMode(_ display: CGDirectDisplayID, _ index: UnsafeMutablePointer<Int32>) -> Int32
+func CGSGetCurrentDisplayMode(_ display: CGDirectDisplayID, _ index: UnsafeMutablePointer<Int32>) -> Int32 {
+    PrivateAPI.currentMode?(display, index) ?? PrivateAPI.missing
+}
 
-@_silgen_name("CGSConfigureDisplayMode")
-func CGSConfigureDisplayMode(_ config: CGDisplayConfigRef?, _ display: CGDirectDisplayID, _ index: Int32) -> Int32
+func CGSConfigureDisplayMode(_ config: CGDisplayConfigRef?, _ display: CGDirectDisplayID, _ index: Int32) -> Int32 {
+    PrivateAPI.configureMode?(config, display, index) ?? PrivateAPI.missing
+}
 
 /// The few settings that outlive a launch. A pause is deliberately not one of
 /// them: coming back from a reboot with switching silently off would look like
@@ -157,6 +209,113 @@ enum SwitchOffHelper {
     }
 }
 
+/// Starts a process in a session of its own, so it outlives this app's
+/// process group and the signals sent to it on the way out. Nil when it
+/// could not be started.
+func spawnDetached(_ path: String, _ arguments: [String]) -> pid_t? {
+    var attributes: posix_spawnattr_t?
+    guard posix_spawnattr_init(&attributes) == 0 else { return nil }
+    defer { posix_spawnattr_destroy(&attributes) }
+    // Nothing of this process's open files goes along; the helpers need none.
+    let flags = Int16(POSIX_SPAWN_SETSID) | Int16(POSIX_SPAWN_CLOEXEC_DEFAULT)
+    guard posix_spawnattr_setflags(&attributes, flags) == 0 else { return nil }
+
+    let environment = ["PATH=/usr/bin:/bin:/usr/sbin:/sbin"]
+    var argv = ([path] + arguments).map { strdup($0) } + [nil]
+    var envp = environment.map { strdup($0) } + [nil]
+    defer {
+        argv.forEach { free($0) }
+        envp.forEach { free($0) }
+    }
+    var pid: pid_t = 0
+    let status = posix_spawn(&pid, path, nil, &attributes, &argv, &envp)
+    guard status == 0 else {
+        Log.error(.lifecycle, "could not start a helper process", ["path": path, "code": status])
+        return nil
+    }
+    return pid
+}
+
+// MARK: - Panel watchdog
+
+/// The panel is switched off for the session, which outlasts this process:
+/// after a crash or a force quit it stays dark, and unplugging the monitor
+/// then leaves no screen at all. A copy of the binary started with this flag
+/// waits for the app to end and switches the panel back on, the same thing
+/// a clean exit does. After a clean exit it finds nothing left to do.
+enum PanelWatchdog {
+    static let flag = "--restore-builtin-after"
+
+    static func runIfRequested() {
+        let arguments = CommandLine.arguments
+        guard arguments.count >= 3, arguments[1] == flag else { return }
+        guard let parent = pid_t(arguments[2]), parent > 1 else { exit(2) }
+        // The app's process group gets these on logout and from build.sh.
+        signal(SIGHUP, SIG_IGN)
+        signal(SIGINT, SIG_IGN)
+        signal(SIGTERM, SIG_IGN)
+
+        let source = DispatchSource.makeProcessSource(identifier: parent, eventMask: .exit, queue: .main)
+        source.setEventHandler {
+            source.cancel()
+            restore(attempt: 1)
+        }
+        source.resume()
+        // Gone before the source was watching: nothing would ever fire.
+        if kill(parent, 0) != 0 && errno == ESRCH {
+            source.cancel()
+            restore(attempt: 1)
+        }
+        dispatchMain()
+    }
+
+    private static func restore(attempt: Int) {
+        var count: UInt32 = 0
+        var displays = [CGDirectDisplayID](repeating: 0, count: 16)
+        guard CGGetOnlineDisplayList(16, &displays, &count) == .success,
+              let id = displays.prefix(Int(count)).first(where: { CGDisplayIsBuiltin($0) != 0 }) else {
+            // Lid closed: macOS brings the panel back when it opens.
+            finish()
+        }
+
+        if CGDisplayIsActive(id) == 0 && CGDisplayIsInMirrorSet(id) == 0 {
+            var config: CGDisplayConfigRef?
+            var ok = CGBeginDisplayConfiguration(&config) == .success
+            if ok {
+                ok = CGSConfigureDisplayEnabled(config, id, true) == .success
+                    && CGCompleteDisplayConfiguration(config, .forSession) == .success
+                if !ok { CGCancelDisplayConfiguration(config) }
+            }
+            guard ok else {
+                if attempt < 5 {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) { restore(attempt: attempt + 1) }
+                    return
+                }
+                Log.error(.display, "panel watchdog could not switch the built-in display on", ["attempts": attempt])
+                finish()
+            }
+            Log.warning(.display, "app ended with the built-in display off, switched it back on")
+        }
+
+        // A panel switched off was set to zero first, and one caught in the
+        // middle of a switch may be at zero without being off.
+        var level: Float = 0
+        if DisplayServicesGetBrightness(id, &level) == 0, level < 0.01 {
+            let stored = UserDefaults.standard.float(forKey: Preference.restoreBrightness)
+            let restored = min(max(stored, 0.05), 1.0)
+            if DisplayServicesSetBrightness(id, restored) != 0 {
+                Log.error(.brightness, "panel watchdog could not restore brightness", ["level": restored])
+            }
+        }
+        finish()
+    }
+
+    private static func finish() -> Never {
+        Log.flush()
+        exit(0)
+    }
+}
+
 // MARK: - Log
 
 /// Errors and the events around them, kept on this Mac only, in two places:
@@ -192,6 +351,7 @@ enum Log {
     static let file = directory.appendingPathComponent("events.jsonl")
     static let previousFile = directory.appendingPathComponent("events.1.jsonl")
     static let maxFileBytes: UInt64 = 2_000_000
+    private static let homePath = FileManager.default.homeDirectoryForCurrentUser.path
 
     private static let queue = DispatchQueue(label: "AutoDisplayToggle.log", qos: .utility)
     // Touched only on `queue`.
@@ -264,8 +424,10 @@ enum Log {
                              at now: Date) {
         let detail = fields.keys.sorted().map { "\($0)=\(fields[$0]!)" }.joined(separator: " ")
         let text = detail.isEmpty ? message : "\(message) \(detail)"
+        // The unified log ends up in sysdiagnose archives that get shared, so
+        // the account name in a home folder path goes out of it as ~.
         Logger(subsystem: subsystem, category: category.rawValue)
-            .log(level: level.osLogType, "\(text, privacy: .public)")
+            .log(level: level.osLogType, "\(text.replacingOccurrences(of: homePath + "/", with: "~/"), privacy: .public)")
 
         var record: [String: Any] = ["ts": timestamp.string(from: now),
                                      "level": level.rawValue,
@@ -303,9 +465,10 @@ enum Log {
 
     /// The current and the previous file together, after queued writes land.
     static func totalBytes() -> UInt64 {
+        // Writes go straight to the file, so its size is already current; no
+        // fsync on the main thread every time the menu opens.
         queue.sync {
-            try? handle?.synchronize()
-            return [file, previousFile].reduce(0) { total, url in
+            [file, previousFile].reduce(0) { total, url in
                 let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)??.uint64Value
                 return total + (size ?? 0)
             }
@@ -421,7 +584,8 @@ enum Log {
         defaults.set(true, forKey: Preference.sessionOpen)
         defaults.removeObject(forKey: Preference.poweringOffAt)
         startDrainTimer()
-        reportCrashes()
+        // A folder scan, off the main thread at launch.
+        DispatchQueue.global(qos: .utility).async { reportCrashes() }
     }
 
     /// The session is ending: logout, restart or shutdown. Written to disk at
@@ -570,7 +734,8 @@ final class MenuSwitchView: NSView {
     func setOn(_ on: Bool, animated: Bool) {
         guard on != isOn else { return }
         isOn = on
-        updateLayers(animated: animated && window != nil && !isHidden)
+        updateLayers(animated: animated && window != nil && !isHidden
+                     && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)
     }
 
     override func updateLayer() {
@@ -662,11 +827,12 @@ final class MenuSwitchView: NSView {
 /// column. Drawing every row the same way keeps that column straight by
 /// construction.
 ///
-/// A menu item that carries a view gets neither drawing nor action handling
-/// from AppKit: the view draws its own highlight and turns clicks into
+/// A menu item that carries a view gets no drawing from AppKit, and its clicks
+/// go to the view: the view draws its own highlight and turns clicks into
 /// `onClick`. That is what lets a switch flip in place instead of dismissing
 /// the menu on every click — and it also means a row that should close the menu
-/// has to say so itself.
+/// has to say so itself. The keyboard still goes through the menu: arrow keys
+/// highlight the item (see `isMenuHighlighted`) and Return sends its action.
 final class MenuRowView: NSView {
 
     enum Style {
@@ -711,6 +877,17 @@ final class MenuRowView: NSView {
     }
     private var rowTrackingArea: NSTrackingArea?
 
+    /// The menu has this row's item highlighted, which is how the arrow keys
+    /// move through it; hovering alone never tells a keyboard user where they
+    /// are.
+    var isMenuHighlighted = false {
+        didSet {
+            guard isMenuHighlighted != oldValue else { return }
+            applyColors()
+            needsDisplay = true
+        }
+    }
+
     private let leadingInset: CGFloat = 14
     private let trailingInset: CGFloat = 14
     private let iconWidth: CGFloat = 16
@@ -735,6 +912,7 @@ final class MenuRowView: NSView {
         slider.maxValue = 1.0
         slider.isContinuous = true
         slider.refusesFirstResponder = true
+        slider.setAccessibilityElement(true)
         slider.target = self
         slider.action = #selector(sliderMoved)
 
@@ -822,20 +1000,36 @@ final class MenuRowView: NSView {
     }
 
     private func applyAccessibility() {
-        if case .toggle(let isOn) = content.accessory {
+        // What the row shows beside its title is read too: a display row says
+        // nothing without its "On", nor a rate without "pinned".
+        var extras: [String] = []
+        if let hint = content.hint { extras.append(hint) }
+        switch content.accessory {
+        case .toggle(let isOn):
+            setAccessibilityElement(true)
             setAccessibilityRole(.checkBox)
             setAccessibilityValue(isOn)
-        } else {
+        case .slider:
+            // The slider itself is the control; the row only names it.
+            setAccessibilityElement(false)
+            slider.setAccessibilityLabel(content.title)
+            slider.setAccessibilityValueDescription(detailField.stringValue)
+        case .detail(let text):
+            setAccessibilityElement(true)
+            setAccessibilityRole(content.isInteractive ? .button : .staticText)
+            setAccessibilityValue(nil)
+            extras.insert(text, at: 0)
+        case .none:
+            setAccessibilityElement(true)
             setAccessibilityRole(content.isInteractive ? .button : .staticText)
             setAccessibilityValue(nil)
         }
-        setAccessibilityLabel([content.title, content.subtitle]
-            .compactMap { $0 }
+        setAccessibilityLabel(([content.title, content.subtitle].compactMap { $0 } + extras)
             .joined(separator: ", "))
     }
 
     private var showsHighlight: Bool {
-        isHovered && content.isInteractive && content.isEnabled
+        (isHovered || isMenuHighlighted) && content.isInteractive && content.isEnabled
     }
 
     private func applyColors() {
@@ -874,6 +1068,15 @@ final class MenuRowView: NSView {
     /// which never produces a mouseExited.
     func resetHover() {
         isHovered = false
+        isMenuHighlighted = false
+    }
+
+    /// Return on a highlighted row, sent through its menu item. A click was
+    /// already handled in mouseDown, so only the keyboard gets through here.
+    @objc func performFromMenu(_ sender: Any?) {
+        guard let event = NSApp.currentEvent, event.type == .keyDown else { return }
+        guard content.isInteractive, content.isEnabled else { return }
+        onClick?()
     }
 
     // ---------- Layout ----------
@@ -1385,11 +1588,15 @@ struct EDID: Equatable {
         var hdmi: Int?
         var hdmiForum: Int?
         for base in ceaBlocks {
-            let end = base + Int(bytes[base + 2])
+            // The data blocks end where the timing descriptors start. A value
+            // past the block, or a block running past that end, is a broken
+            // EDID and must not be read beyond the 128 bytes it came in.
+            let end = min(base + Int(bytes[base + 2]), base + 127)
             var pos = base + 4
             while pos < end {
                 let tag = bytes[pos] >> 5
                 let length = Int(bytes[pos] & 0x1F)
+                guard pos + length < end else { break }
                 if tag == 3, length >= 3 {
                     let oui = Int(bytes[pos + 1]) | Int(bytes[pos + 2]) << 8 | Int(bytes[pos + 3]) << 16
                     if oui == 0x000C03, length >= 7, bytes[pos + 7] != 0 { hdmi = Int(bytes[pos + 7]) * 5 }
@@ -1415,13 +1622,15 @@ struct EDID: Equatable {
               limits.maxVHz > 0, limits.maxHKHz > 0 else { return nil }
         let clockCap = [limits.maxPixelClockMHz, maxTMDSClockMHz].compactMap { $0 }.min()
 
-        for hz in [240, 165, 144, 120, 100, 90, 85, 75, 72] where hz > listedHz && hz <= limits.maxVHz {
+        for hz in [240, 165, 144, 120, 100, 90, 85, 75, 72]
+        where hz > listedHz && hz <= limits.maxVHz && hz >= limits.minVHz {
             for version in [1, 2] {
                 guard var timing = DetailedTiming.reducedBlanking(width: native.hActive,
                                                                   height: native.vActive,
                                                                   hz: Double(hz),
                                                                   version: version) else { continue }
-                guard timing.hFreqKHz <= Double(limits.maxHKHz) else { continue }
+                guard timing.hFreqKHz <= Double(limits.maxHKHz),
+                      timing.hFreqKHz >= Double(limits.minHKHz) else { continue }
                 if let cap = clockCap, timing.pixelClockMHz > Double(cap) { continue }
                 timing.hImageMM = native.hImageMM
                 timing.vImageMM = native.vImageMM
@@ -1567,44 +1776,52 @@ enum DisplayOverride {
         if fm.isWritableFile(atPath: file), (try? data.write(to: URL(fileURLWithPath: file))) != nil { return }
         if fm.isWritableFile(atPath: folder), (try? data.write(to: URL(fileURLWithPath: file), options: .atomic)) != nil { return }
 
-        let staged = fm.temporaryDirectory.appendingPathComponent("AutoDisplayToggle-override-\(UUID().uuidString).plist")
-        do {
-            try data.write(to: staged)
-        } catch {
-            throw Failure.failed(error.localizedDescription)
-        }
-        defer { try? fm.removeItem(at: staged) }
-        try runPrivileged("mkdir -p \(shellQuoted(folder)) && cp \(shellQuoted(staged.path)) \(shellQuoted(file)) && chmod 644 \(shellQuoted(file))")
+        try runPrivileged("mkdir -p \(shellQuoted(folder)) && \(stagedAsRoot(data)) && /bin/cp \"$t\" \(shellQuoted(file)) && /bin/chmod 644 \(shellQuoted(file))",
+                          summary: "write \(file)")
     }
 
     static func shellQuoted(_ text: String) -> String {
         "'" + text.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
+    /// Shell that leaves `data` in a file only root can write, named by `$t`
+    /// and removed when the command ends. The bytes travel inside the command
+    /// itself: a staging file in the user's temporary folder could be swapped
+    /// by any process of that user while the administrator prompt is up, and
+    /// root would then install whatever it found there.
+    static func stagedAsRoot(_ data: Data) -> String {
+        "t=$(/usr/bin/mktemp /tmp/AutoDisplayToggle.XXXXXX) && trap '/bin/rm -f \"$t\"' EXIT && "
+            + "/usr/bin/printf '%s' \(shellQuoted(data.base64EncodedString())) | /usr/bin/base64 -D -o \"$t\""
+    }
+
+    /// `summary` stands in for `command` in the log when the command carries
+    /// a payload too long to be worth a log line.
     static func runPrivileged(_ command: String,
-                              prompt: String = "AutoDisplayToggle wants to update a display override.") throws {
+                              prompt: String = "AutoDisplayToggle wants to update a display override.",
+                              summary: String? = nil) throws {
+        let logged = summary ?? command
         let escape = { (text: String) in
             text.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
         }
         let source = "do shell script \"\(escape(command))\" with prompt \"\(escape(prompt))\" with administrator privileges"
         var error: NSDictionary?
         guard let script = NSAppleScript(source: source) else {
-            Log.error(.override, "privileged script could not be compiled", ["command": command])
+            Log.error(.override, "privileged script could not be compiled", ["command": logged])
             throw Failure.failed("Could not prepare the request.")
         }
         script.executeAndReturnError(&error)
         guard let error = error else {
-            Log.info(.override, "privileged command ran", ["command": command])
+            Log.info(.override, "privileged command ran", ["command": logged])
             return
         }
         let number = error[NSAppleScript.errorNumber] as? Int
         let message = error[NSAppleScript.errorMessage] as? String ?? "Unknown error"
         if number == -128 {
-            Log.info(.override, "administrator prompt cancelled", ["command": command])
+            Log.info(.override, "administrator prompt cancelled", ["command": logged])
             throw Failure.cancelled
         }
         Log.error(.override, "privileged command failed",
-                  ["command": command, "code": number ?? 0, "error": message])
+                  ["command": logged, "code": number ?? 0, "error": message])
         throw Failure.failed(message)
     }
 }
@@ -1714,21 +1931,13 @@ enum SleepControl {
             \(user) ALL=(root) NOPASSWD: \(pmset) -a disablesleep 0, \(pmset) -a disablesleep 1, \(pmset) sleepnow
 
             """
-        let fm = FileManager.default
-        let staged = fm.temporaryDirectory.appendingPathComponent("AutoDisplayToggle-sudoers-\(UUID().uuidString)")
-        do {
-            try rule.write(to: staged, atomically: true, encoding: .utf8)
-        } catch {
-            throw DisplayOverride.Failure.failed(error.localizedDescription)
-        }
-        defer { try? fm.removeItem(at: staged) }
-
-        let q = DisplayOverride.shellQuoted
+        let staged = DisplayOverride.stagedAsRoot(Data(rule.utf8))
         // visudo checks the file before it goes live: a broken file in
         // sudoers.d would lock sudo out for every command, not just these.
         try DisplayOverride.runPrivileged(
-            "/usr/sbin/visudo -cf \(q(staged.path)) && /usr/bin/install -m 0440 -o root -g wheel \(q(staged.path)) \(q(sudoersPath))",
-            prompt: "AutoDisplayToggle wants to allow switching system sleep off while an external display is connected.")
+            "\(staged) && /usr/sbin/visudo -cf \"$t\" && /usr/bin/install -m 0440 -o root -g wheel \"$t\" \(DisplayOverride.shellQuoted(sudoersPath))",
+            prompt: "AutoDisplayToggle wants to allow switching system sleep off while an external display is connected.",
+            summary: "install \(sudoersPath)")
     }
 }
 
@@ -1884,14 +2093,20 @@ struct ScaleMode: Equatable {
                 CGSGetDisplayModeDescriptionOfLength(id, index, $0.baseAddress!, Int32(descriptionLength))
             }
             guard status == 0 else { continue }
+            // The layout of this private struct is not published. Values that
+            // make no sense mean it changed, and such a mode is left out
+            // rather than handed to the size matching.
             let mode = bytes.withUnsafeBytes { raw in
                 ScaleMode(index: index,
-                          width: Int(raw.load(fromByteOffset: 8, as: UInt32.self)),
-                          height: Int(raw.load(fromByteOffset: 12, as: UInt32.self)),
-                          hz: Int(raw.load(fromByteOffset: 190, as: UInt16.self)),
-                          density: raw.load(fromByteOffset: 208, as: Float.self))
+                          width: Int(raw.loadUnaligned(fromByteOffset: 8, as: UInt32.self)),
+                          height: Int(raw.loadUnaligned(fromByteOffset: 12, as: UInt32.self)),
+                          hz: Int(raw.loadUnaligned(fromByteOffset: 190, as: UInt16.self)),
+                          density: raw.loadUnaligned(fromByteOffset: 208, as: Float.self))
             }
-            if mode.width > 0 && mode.height > 0 { modes.append(mode) }
+            guard mode.width > 0, mode.width <= 16_384, mode.height > 0, mode.height <= 16_384,
+                  mode.hz >= 0, mode.hz <= 1_000,
+                  mode.density.isFinite, mode.density >= 0, mode.density <= 8 else { continue }
+            modes.append(mode)
         }
         return modes
     }
@@ -1956,7 +2171,11 @@ enum UISize {
 
         // One mode per size, at the rate the display runs or is pinned to.
         let picks = Dictionary(grouping: candidates, by: { $0.sizeKey }).values.compactMap { group -> ScaleMode? in
-            if let hz = preferredHz, let mode = group.first(where: { abs($0.hz - hz) <= 1 }) { return mode }
+            // Exact first: a size listing both 59 and 60 must not land on 59.
+            if let hz = preferredHz,
+               let mode = group.first(where: { $0.hz == hz }) ?? group.first(where: { abs($0.hz - hz) <= 1 }) {
+                return mode
+            }
             if let mode = group.first(where: { $0.hz == current.hz }) { return mode }
             return group.max { $0.hz < $1.hz }
         }
@@ -2028,7 +2247,7 @@ struct MenuState: Equatable {
     var isPaused: Bool { pauseMode != nil }
 
     var headerTitle: String {
-        guard internalDisplayPresent else { return "Built-in display not detected" }
+        guard internalDisplayPresent else { return "Internal display not detected" }
         if internalDisplay?.isMirrored == true { return "Internal display is mirroring" }
         return internalDisplayActive ? "Internal display is on" : "Internal display is off"
     }
@@ -2131,6 +2350,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
     var isSleeping = false
+    /// The panel was switched on but its backlight could not be set, so it
+    /// may still sit at zero; see restoreBrightness.
+    var brightnessRestorePending = false
     /// Display sleep, set from screensDidSleep and cleared only by a wake or a
     /// sign of the user at the keyboard. Unlike isSleeping, screen-parameter
     /// changes never clear it: a sleeping monitor drops out of the active list,
@@ -2181,6 +2403,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var reportedGivingUp = false
 
     var reconcileWorkItem: DispatchWorkItem?
+    /// When reconcileWorkItem runs; nil once it has.
+    var reconcileDueAt: Date?
     var reconcileTimer: Timer?
     var lastKnownInternalActive: Bool?
     var signalSources: [DispatchSourceSignal] = []
@@ -2320,12 +2544,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // time the displays change.
     var pauseMode: PauseMode?
     var pauseDeadline: Date?
-    var pausedExternalCount = 0
+    /// The external displays showing when the pause began, by monitor; a
+    /// sorted list rather than a set, so two identical monitors without a
+    /// serial number still count twice.
+    var pausedExternals: [String] = []
     var pauseTimer: Timer?
 
     // Refresh rate section: a pool like the display rows, filled with one
     // header per external display followed by its rates.
-    let maxRefreshRateRows = 16
+    let initialRefreshRateRows = 16
     var refreshRateRows: [MenuRowView] = []
     var refreshRateRowItems: [NSMenuItem] = []
     var refreshRateSeparatorItem: NSMenuItem!
@@ -2387,6 +2614,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ aNotification: Notification) {
         Log.launch()
+        startPanelWatchdog()
+        // A sleep watchdog left by a run that crashed would switch sleep back
+        // on under this one, which takes the state over in loadPreferences.
+        retireStaleSleepWatchdogs()
         loadPreferences()
         resolveInternalDisplay()
         logDisplays("displays at launch")
@@ -2409,6 +2640,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // تا اولین نوتیفیکیشن هم با آیکن خود برنامه نمایش داده شود.
         setupNotifications {
             self.sendNotification(title: "AutoDisplayToggle", message: "🖥️ Service is now active in the menu bar.")
+            if !PrivateAPI.canSwitchPanel {
+                self.sendNotification(title: "Switching Unavailable",
+                                      message: "⚠️ This macOS lacks the private display calls the app relies on, so the internal display cannot be switched.",
+                                      isWarning: true)
+            }
         }
     }
 
@@ -2478,13 +2714,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         refreshRateSeparatorItem = NSMenuItem.separator()
         menu.addItem(refreshRateSeparatorItem)
 
-        for _ in 0..<maxRefreshRateRows {
-            let row = MenuRowView(style: .single)
-            let item = rowItem(row, accessibilityTitle: "Refresh rate")
-            item.isHidden = true
-            refreshRateRows.append(row)
-            refreshRateRowItems.append(item)
-            menu.addItem(item)
+        for _ in 0..<initialRefreshRateRows {
+            menu.addItem(makeRefreshRateRow())
         }
 
         highestRateRow = MenuRowView(style: .single)
@@ -2616,12 +2847,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         renderLogsRow()
     }
 
+    /// One more pooled refresh rate row, hidden until a render fills it.
+    func makeRefreshRateRow() -> NSMenuItem {
+        let row = MenuRowView(style: .single)
+        let item = rowItem(row, accessibilityTitle: "Refresh rate")
+        item.isHidden = true
+        refreshRateRows.append(row)
+        refreshRateRowItems.append(item)
+        return item
+    }
+
     func rowItem(_ view: MenuRowView, accessibilityTitle: String) -> NSMenuItem {
         let item = NSMenuItem()
         // The title never draws once a view is attached, but VoiceOver and the
         // menu's own bookkeeping still read it.
         item.title = accessibilityTitle
         item.view = view
+        // Return on a row the arrow keys reached. Mouse clicks never get here.
+        item.target = view
+        item.action = #selector(MenuRowView.performFromMenu(_:))
         return item
     }
 
@@ -2907,6 +3151,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        // The pool starts at a size that covers one or two monitors and grows,
+        // never shrinks, when more rows are needed: a fixed cap used to drop
+        // the last monitor's rates and its Unlock and Remove rows silently.
+        if entries.count > refreshRateRows.count, let menu = statusItem.menu {
+            let insertAt = menu.index(of: highestRateItem)
+            for offset in 0..<(entries.count - refreshRateRows.count) {
+                menu.insertItem(makeRefreshRateRow(), at: insertAt + offset)
+                menuRows.append(refreshRateRows[refreshRateRows.count - 1])
+            }
+        }
+
         for (index, row) in refreshRateRows.enumerated() {
             let item = refreshRateRowItems[index]
             guard index < entries.count else {
@@ -3074,7 +3329,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         pauseMode = mode
         pauseDeadline = duration.map { Date().addingTimeInterval($0) }
-        pausedExternalCount = activeExternalCount()
+        pausedExternals = showingExternals()
         startPauseTimer()
 
         switch mode {
@@ -3132,7 +3387,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             }
         case .untilDisplayChange:
-            if activeExternalCount() != pausedExternalCount {
+            // A sleeping monitor drops out of the active list, and one waking
+            // up takes a few seconds to come back; neither is a change.
+            let settling = wakeSettleUntil.map { $0 > Date() } ?? false
+            if !displaysAsleep, !settling, showingExternals() != pausedExternals {
                 resumeNow()
                 return
             }
@@ -3142,8 +3400,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         refreshMenu()
     }
 
-    func activeExternalCount() -> Int {
-        surveyDisplays().filter { !$0.isBuiltin && $0.isShowing }.count
+    /// Which monitors are showing a picture, so swapping one monitor for
+    /// another counts as a change even though the number stays the same.
+    func showingExternals() -> [String] {
+        surveyDisplays().filter { !$0.isBuiltin && $0.isShowing }.map { displayKey($0.id) }.sorted()
     }
 
     // ---------- Menu preferences ----------
@@ -3186,7 +3446,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             && mode.pixelWidth == current.pixelWidth && mode.pixelHeight == current.pixelHeight {
             let label = RefreshRateInfo.label(mode.refreshRate)
             // The current mode wins its own slot, so re-picking it is a no-op.
-            if byLabel[label] == nil || mode.ioDisplayModeID == current.ioDisplayModeID {
+            // Otherwise the nearer to the label wins, the same one every time:
+            // 60 over 59.94, rather than whichever the list happened to give first.
+            if let existing = byLabel[label], existing.ioDisplayModeID == current.ioDisplayModeID { continue }
+            if mode.ioDisplayModeID == current.ioDisplayModeID
+                || byLabel[label].map({ abs(mode.refreshRate - Double(label)) < abs($0.refreshRate - Double(label)) }) ?? true {
                 byLabel[label] = mode
             }
         }
@@ -3418,9 +3682,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                                        "hz": label],
                                       forKey: Preference.pendingRefreshTrial)
         }
-        defer { if confirm { UserDefaults.standard.removeObject(forKey: Preference.pendingRefreshTrial) } }
+        let trialDisplay = displayKey(displayID)
 
         guard applyDisplayMode(target, to: displayID, option: .permanently) else {
+            if confirm { UserDefaults.standard.removeObject(forKey: Preference.pendingRefreshTrial) }
             sendNotification(title: "Refresh Rate Failed",
                              message: "⚠️ Could not switch \(name) to \(label) Hz.",
                              isWarning: true)
@@ -3428,6 +3693,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         guard confirm else {
+            settledRefreshRates[trialDisplay] = label
             sendNotification(title: "Refresh Rate", message: "⚡️ \(name) is now running at \(label) Hz.")
             return true
         }
@@ -3436,6 +3702,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         Log.info(.refreshRate, "trial answered", ["display": name, "hz": label, "answer": String(describing: answer)])
         switch answer {
         case .keep:
+            UserDefaults.standard.removeObject(forKey: Preference.pendingRefreshTrial)
+            // A size match running before the next one sees this rate would
+            // otherwise pick the old one back as the settled rate.
+            settledRefreshRates[trialDisplay] = label
             if let key = verdictKey {
                 trustedRefreshRates.insert(key)
                 rejectedRefreshRates.remove(key)
@@ -3451,10 +3721,41 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             break
         }
 
-        applyDisplayMode(previous, to: displayID, option: .permanently)
-        sendNotification(title: "Refresh Rate Reverted",
-                         message: "↩️ \(name) is back at \(RefreshRateInfo.label(previous.refreshRate)) Hz.")
+        let previousLabel = RefreshRateInfo.label(previous.refreshRate)
+        switch putModeBack(previous.ioDisplayModeID, displayKey: trialDisplay, lastID: displayID) {
+        case true?:
+            UserDefaults.standard.removeObject(forKey: Preference.pendingRefreshTrial)
+            sendNotification(title: "Refresh Rate Reverted",
+                             message: "↩️ \(name) is back at \(previousLabel) Hz.")
+        case false?:
+            // The saved trial stays, so the old rate is tried again the next
+            // time the display shows up, at the latest on the next launch.
+            Log.error(.refreshRate, "could not revert trial", ["display": trialDisplay, "hz": previousLabel])
+            sendNotification(title: "Refresh Rate Not Reverted",
+                             message: "⚠️ Could not put \(name) back at \(previousLabel) Hz. It is tried again when the display reconnects.",
+                             isWarning: true)
+        case nil:
+            UserDefaults.standard.removeObject(forKey: Preference.pendingRefreshTrial)
+            Log.error(.refreshRate, "previous mode gone, trial not reverted", ["display": trialDisplay, "hz": previousLabel])
+            sendNotification(title: "Refresh Rate Not Reverted",
+                             message: "⚠️ \(name) no longer offers its previous \(previousLabel) Hz mode. Pick a rate from the menu.",
+                             isWarning: true)
+        }
         return false
+    }
+
+    /// Puts a display back on the mode a trial replaced. The display is found
+    /// again by monitor if its ID changed, as it does when the cable is
+    /// reseated. True when the mode is on, false when setting it failed and is
+    /// worth another try, nil when the display does not offer it any more.
+    func putModeBack(_ modeID: Int32, displayKey key: String, lastID: CGDirectDisplayID) -> Bool? {
+        let id = CGDisplayIsOnline(lastID) != 0 && displayKey(lastID) == key
+            ? lastID
+            : onlineDisplays().first { CGDisplayIsBuiltin($0) == 0 && displayKey($0) == key }
+        guard let id = id else { return false }
+        if CGDisplayCopyDisplayMode(id)?.ioDisplayModeID == modeID { return true }
+        guard let mode = allDisplayModes(for: id).first(where: { $0.ioDisplayModeID == modeID }) else { return nil }
+        return applyDisplayMode(mode, to: id, option: .permanently)
     }
 
     /// Puts back the rate a trial replaced when the trial never got its
@@ -3470,17 +3771,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard let id = onlineDisplays().first(where: { CGDisplayIsBuiltin($0) == 0 && displayKey($0) == key }) else {
             return
         }
-        UserDefaults.standard.removeObject(forKey: Preference.pendingRefreshTrial)
         let hz = trial["hz"] as? Int
         if let hz = hz, let info = refreshRateInfo(id) {
             // Not offered again by itself: it already failed to get an answer once.
             rejectedRefreshRates.insert(info.verdictKey(hz))
             trustedRefreshRates.remove(info.verdictKey(hz))
         }
-        guard CGDisplayCopyDisplayMode(id)?.ioDisplayModeID != Int32(modeID) else { return }
-        guard let mode = allDisplayModes(for: id).first(where: { $0.ioDisplayModeID == Int32(modeID) }),
-              applyDisplayMode(mode, to: id, option: .permanently) else {
-            Log.error(.refreshRate, "could not revert interrupted trial", ["display": key, "modeID": modeID])
+        let alreadyBack = CGDisplayCopyDisplayMode(id)?.ioDisplayModeID == Int32(modeID)
+        switch putModeBack(Int32(modeID), displayKey: key, lastID: id) {
+        case true?:
+            UserDefaults.standard.removeObject(forKey: Preference.pendingRefreshTrial)
+            if alreadyBack { return }
+        case false?:
+            // Kept for the next time this display shows up: a monitor still
+            // waking at login can turn a mode set down.
+            Log.error(.refreshRate, "could not revert interrupted trial, will retry", ["display": key, "modeID": modeID])
+            return
+        case nil:
+            UserDefaults.standard.removeObject(forKey: Preference.pendingRefreshTrial)
+            Log.error(.refreshRate, "could not revert interrupted trial, mode gone", ["display": key, "modeID": modeID])
             return
         }
         Log.warning(.refreshRate, "interrupted trial reverted", ["display": key, "hz": hz ?? 0, "modeID": modeID])
@@ -3504,8 +3813,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func confirmRefreshRate(label: Int, name: String, displayID: CGDirectDisplayID, targetModeID: Int32) -> RefreshRateAnswer {
         let alert = NSAlert()
         alert.messageText = "Keep \(label) Hz on \(name)?"
-        alert.addButton(withTitle: "Keep")
-        alert.addButton(withTitle: "Revert").keyEquivalent = "\u{1b}"
+        // Revert is the default: a rate that leaves the screen black gets
+        // answered by a blind Return, and that must not keep it.
+        alert.addButton(withTitle: "Revert")
+        alert.addButton(withTitle: "Keep").keyEquivalent = ""
 
         // The longest text goes in first: an alert sizes itself when shown.
         let waitingText = "Waiting for \(name) to settle. Some monitors search their inputs for a while after a rate change, so the countdown only starts once the picture is back."
@@ -3561,8 +3872,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         timer.invalidate()
 
         switch response {
-        case .alertFirstButtonReturn: return .keep
-        case .alertSecondButtonReturn: return .revert
+        case .alertFirstButtonReturn: return .revert
+        case .alertSecondButtonReturn: return .keep
         default: return .timedOut
         }
     }
@@ -3789,8 +4100,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             or from the Apple menu either. Displays still sleep.
 
             Sleep comes back as soon as the last external display is unplugged, and a closed Mac is \
-            put to sleep right then. It also comes back below \(lidAwakeBatteryFloor)% battery. If \
-            the app is force quit or crashes while sleep is off, sleep stays off until the app runs again.
+            put to sleep right then. It also comes back below \(lidAwakeBatteryFloor)% battery, and \
+            if the app is force quit or crashes while sleep is off.
 
             The first time, macOS asks for an administrator password to add a rule in \
             \(SleepControl.sudoersPath) that lets AutoDisplayToggle run "pmset disablesleep" and \
@@ -3929,28 +4240,46 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         while /bin/kill -0 "$1" 2>/dev/null; do /bin/sleep 5; done
         exec \(SleepControl.sudo) -n \(SleepControl.pmset) -a disablesleep 0
         """
-        var attributes: posix_spawnattr_t?
-        posix_spawnattr_init(&attributes)
-        defer { posix_spawnattr_destroy(&attributes) }
-        posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETSID))
-
-        let arguments = ["/bin/sh", "-c", script, "autodisplaytoggle-sleep-watchdog", String(getpid())]
-        let environment = ["PATH=/usr/bin:/bin:/usr/sbin:/sbin"]
-        var argv = arguments.map { strdup($0) } + [nil]
-        var envp = environment.map { strdup($0) } + [nil]
-        defer {
-            argv.forEach { free($0) }
-            envp.forEach { free($0) }
-        }
-
-        var pid: pid_t = 0
-        let status = posix_spawn(&pid, "/bin/sh", nil, &attributes, &argv, &envp)
-        guard status == 0 else {
-            Log.error(.sleep, "sleep watchdog failed to start", ["code": status])
+        guard let pid = spawnDetached("/bin/sh", ["-c", script, sleepWatchdogName, String(getpid())]) else {
+            Log.error(.sleep, "sleep watchdog failed to start")
+            sendNotification(title: "Sleep Watchdog Unavailable",
+                             message: "⚠️ If the app quits unexpectedly, sleep stays off until it runs again.",
+                             isWarning: true)
             return
         }
         sleepWatchdogPID = pid
         Log.info(.sleep, "sleep watchdog started", ["pid": pid])
+    }
+
+    /// The name the sleep watchdog runs under, as `$0` of its shell.
+    let sleepWatchdogName = "autodisplaytoggle-sleep-watchdog"
+
+    func retireStaleSleepWatchdogs() {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+        // KILL: the watchdog ignores TERM on purpose.
+        process.arguments = ["-KILL", "-f", sleepWatchdogName]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            process.waitUntilExit()
+            // pkill exits 1 when there was nothing to end.
+            if process.terminationStatus == 0 { Log.info(.sleep, "stale sleep watchdog ended") }
+        } catch {
+            Log.error(.sleep, "could not look for a stale sleep watchdog", ["error": error.localizedDescription])
+        }
+    }
+
+    /// See PanelWatchdog. It is never stopped: after a clean exit it only
+    /// checks, and after one whose switch-on failed it gets another go.
+    func startPanelWatchdog() {
+        guard let executable = Bundle.main.executablePath,
+              let pid = spawnDetached(executable, [PanelWatchdog.flag, String(getpid())]) else {
+            Log.warning(.lifecycle, "panel watchdog not started")
+            return
+        }
+        Log.info(.lifecycle, "panel watchdog started", ["pid": pid])
     }
 
     func stopSleepWatchdog() {
@@ -4273,6 +4602,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         desktopNeedsRedraw = true
         Log.info(.uiSize, "size applied", fields)
+        // A new size can come with a rate macOS picked for it. Taken as the
+        // display appearing again, so the next rate pass puts the pin or the
+        // highest rate back instead of mistaking it for a pick in System
+        // Settings and pinning it.
+        refreshRatePresentKeys.remove(displayKey(id))
         return true
     }
 
@@ -4343,7 +4677,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         Log.warning(.user, "panic reset", ["wasEnabled": isEnabled])
         // setEnabled(false) خودش مانیتور داخلی را برمی‌گرداند؛ اطلاع‌رسانی‌اش را
         // خاموش می‌کنیم تا دو نوتیفیکیشن پشت سر هم نیاید.
-        if isEnabled { setEnabled(false, notify: false) }
+        // A pause is switched off too, but would switch back on by itself.
+        if isEnabled || pauseMode != nil { setEnabled(false, notify: false) }
         else { _ = setInternalEnabled(true) }
         sendNotification(title: "Panic Reset",
                          message: "✅ Internal display restored. Press ⌃⌥⌘E to turn switching back on.")
@@ -4467,7 +4802,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = message
-        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        // A routine announcement replaces an earlier one saying exactly the
+        // same, so plugging a monitor in and out a few times does not stack
+        // up a column of identical banners. Warnings all stay.
+        let identifier = isWarning ? UUID().uuidString : "routine-\(title)-\(message)"
+        let request = UNNotificationRequest(identifier: identifier, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(request) { error in
             guard let error = error else { return }
             Log.error(.notification, "notification delivery failed", ["title": title, "error": error.localizedDescription])
@@ -4701,6 +5040,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         // قبل از خاموش کردن نور را صفر می‌کنیم تا در لحظه‌ی تغییر، پنل روشن نماند
         if !enabled {
+            brightnessRestorePending = false
             enforceZeroBrightness(id)
             timer.lap("zeroBrightness")
             // A panel in a mirror set cannot simply be switched off: as the
@@ -4748,18 +5088,33 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func settleSwitch(_ enabled: Bool, id: CGDirectDisplayID, _ timer: StepTimer) -> Bool {
         if enabled {
             // کف امنیتی تا در صورت خراب بودن مقدار ذخیره‌شده، صفحه سیاه نماند
-            let level = max(savedBrightness, 0.05)
-            let status = DisplayServicesSetBrightness(id, level)
+            let restored = restoreBrightness(id)
             timer.lap("restoreBrightness")
-            guard status == 0 else {
-                Log.error(.brightness, "brightness restore failed", ["display": id, "level": level, "code": status])
-                return false
-            }
-            return true
+            return restored
         }
         let zeroed = enforceZeroBrightness(id)
         timer.lap("finalZeroBrightness")
         return zeroed
+    }
+
+    /// Lights a panel that was just switched on. A failure is remembered, and
+    /// every pass retries it: the panel already reads as on, so nothing else
+    /// would ever bring its backlight up from zero.
+    @discardableResult
+    func restoreBrightness(_ id: CGDirectDisplayID) -> Bool {
+        // کف امنیتی تا در صورت خراب بودن مقدار ذخیره‌شده، صفحه سیاه نماند
+        let level = max(savedBrightness, 0.05)
+        let status = DisplayServicesSetBrightness(id, level)
+        guard status == 0 else {
+            brightnessRestorePending = true
+            Log.error(.brightness, "brightness restore failed", ["display": id, "level": level, "code": status], throttle: 60)
+            return false
+        }
+        if brightnessRestorePending {
+            brightnessRestorePending = false
+            Log.info(.brightness, "brightness restored on retry", ["display": id, "level": level])
+        }
+        return true
     }
 
     /// Switching off without holding up the app. macOS takes the panel off
@@ -4838,7 +5193,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let timeout = DispatchWorkItem { [weak process] in
             guard let process = process, process.isRunning else { return }
             Log.error(.display, "switch-off helper timed out, ending it", ["pid": Int(process.processIdentifier)])
-            process.terminate()
+            // KILL, as cancelSwitchOffHelper does: a helper stuck in the window
+            // server is not one to count on handling TERM.
+            kill(process.processIdentifier, SIGKILL)
         }
         switchOffHelperTimeout = timeout
         DispatchQueue.main.asyncAfter(deadline: .now() + switchOffHelperLimit, execute: timeout)
@@ -4968,9 +5325,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                      ["reason": screensAsleep ? "screens asleep" : "system asleep", "trigger": trigger], throttle: 300)
             return
         }
-        guard !isApplying else {
-            Log.info(.display, "switching held, a switch is in progress", ["trigger": trigger], throttle: 60)
-            return
+        if isApplying {
+            // A switch-off waits up to ten seconds in its helper. A monitor
+            // unplugged meanwhile leaves every screen black for that long, so
+            // the switch-off gives way the moment nothing else is connected.
+            guard switchOffHelper != nil, !hasActiveExternal() else {
+                Log.info(.display, "switching held, a switch is in progress", ["trigger": trigger], throttle: 60)
+                return
+            }
+            Log.info(.display, "external display gone during switch-off, cancelling it", ["trigger": trigger])
+            cancelSwitchOffHelper()
         }
 
         let id = resolveInternalDisplay()
@@ -5006,6 +5370,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
             // وضعیت فعال/غیرفعال درست است، ولی بک‌لایت ممکن است دوباره روشن شده باشد
             if !desired { enforceZeroBrightness(id) }
+            else if brightnessRestorePending { restoreBrightness(id) }
             return
         }
 
@@ -5106,9 +5471,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // بررسی با تأخیر و بدون انباشت؛ هر درخواست جدید قبلی را لغو می‌کند
     func scheduleReconcile(after delay: TimeInterval, reason: String) {
+        let due = Date().addingTimeInterval(delay)
+        // Lighting the panel for a refresh after wake reconfigures the
+        // displays, and the debounce that follows would keep the panel lit
+        // for seconds instead of the hold. During the hold an earlier pass
+        // already on its way stays.
+        if wakeRefreshing, let refreshed = lastWakeRefreshAt, Date().timeIntervalSince(refreshed) < wakeRefreshHold,
+           let current = reconcileDueAt, current < due, reconcileWorkItem?.isCancelled == false {
+            return
+        }
         reconcileWorkItem?.cancel()
-        let item = DispatchWorkItem { [weak self] in self?.reconcile(trigger: reason) }
+        let item = DispatchWorkItem { [weak self] in
+            self?.reconcileDueAt = nil
+            self?.reconcile(trigger: reason)
+        }
         reconcileWorkItem = item
+        reconcileDueAt = due
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
     }
 
@@ -5145,7 +5523,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self?.logDisplays("screen parameters changed")
             self?.noteActiveDisplayChange()
             self?.isSleeping = false
-            self?.resetFailureState()
+            // No failure reset here: every switch attempt changes the screen
+            // parameters itself, and resetting on that would keep a switch
+            // that never sticks from ever reaching the cooldown. A display
+            // coming or going resets it in displayCallback.
             // The reconcile loop is stopped while paused, so this is the only
             // thing watching for the change that ends a display pause.
             self?.checkPause()
@@ -5291,14 +5672,23 @@ let displayCallback: CGDisplayReconfigurationCallBack = { display, flags, userIn
     }
     DispatchQueue.main.async {
         // A monitor unplugged and back before the next pass still counts
-        // as appearing.
-        if flags.contains(.addFlag) {
-            monitor.refreshRatePresentKeys.remove(monitor.displayKey(display))
+        // as appearing. Any display coming, going, or switching on or off
+        // makes macOS re-time the others too, the monitor dropping to 60 Hz
+        // when the built-in panel lights up among them; that is not the user
+        // picking a rate, so every display counts as appearing again.
+        if flags.contains(.addFlag) || flags.contains(.removeFlag)
+            || flags.contains(.enabledFlag) || flags.contains(.disabledFlag) {
+            monitor.refreshRatePresentKeys.removeAll()
         }
         monitor.isSleeping = false
         monitor.internalDisplayID = 0 // شناسه ممکن است عوض شده باشد
         monitor.edidCache.removeAll()
-        monitor.resetFailureState()
+        // Only a display coming or going is a new situation worth a fresh
+        // set of attempts. The panel's own enable and disable arrive here on
+        // every attempt, failed ones included.
+        if flags.contains(.addFlag) || flags.contains(.removeFlag) {
+            monitor.resetFailureState()
+        }
         monitor.scheduleReconcile(after: 2.0, reason: "display reconfigured")
         monitor.scheduleDesktopPictureCheck()
     }
@@ -5353,6 +5743,14 @@ extension AppDelegate: NSMenuDelegate {
         startMenuRefreshTimer()
     }
 
+    /// The arrow keys move the menu's highlight, which rows with a view have
+    /// to draw themselves.
+    func menu(_ menu: NSMenu, willHighlight item: NSMenuItem?) {
+        for row in menuRows {
+            row.isMenuHighlighted = item != nil && row.enclosingMenuItem === item
+        }
+    }
+
     func menuDidClose(_ menu: NSMenu) {
         isMenuOpen = false
         stopMenuRefreshTimer()
@@ -5379,6 +5777,7 @@ extension AppDelegate: UNUserNotificationCenterDelegate {
 
 // The same binary doubles as the switch-off helper; see SwitchOffHelper.
 SwitchOffHelper.runIfRequested()
+PanelWatchdog.runIfRequested()
 
 let app = NSApplication.shared
 let delegate = AppDelegate()

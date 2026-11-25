@@ -68,8 +68,8 @@ xattr -dr com.apple.quarantine /Applications/AutoDisplayToggle.app
 ### Build from source
 
 ```bash
-git clone https://github.com/sajad3731/auto_display_toggle.git
-cd auto_display_toggle
+git clone https://github.com/sajad3731/AutoDisplayToggle.git
+cd AutoDisplayToggle
 ./build.sh --install
 ```
 
@@ -113,7 +113,7 @@ the menu bar alone says what the app is doing:
 
 | Icon | Meaning |
 | --- | --- |
-| `display.2` | Switching on, internal display lit |
+| `display.2` | Switching on, internal display lit, or not there to switch (lid closed) |
 | `display` | Switching on, internal display dark |
 | `display`, dimmed | Switching off — the app is idle |
 
@@ -164,7 +164,7 @@ Menu items:
 | **Automatic switching** | Master switch — see below. The shortcut beside it is the one that does the same thing from the keyboard |
 | **Restore brightness** | The level the internal panel comes back to |
 | **Pause for 1 hour** | Switching off, resuming by itself an hour later. Only shown while switching is on |
-| **Pause until displays change** | Switching off until a display is connected or disconnected. Only shown while switching is on |
+| **Pause until displays change** | Switching off until a display is connected, disconnected or swapped for another. Only shown while switching is on |
 | **Resume now** | Ends a pause early. Only shown while paused, with the time left beside it |
 | *Display list* | Every connected display, built-in first, and whether it is on, off or mirrored. A setup with more displays than fit ends in *N more displays* |
 | *Refresh rate* | Each external display's current rate, then every rate it offers at its current resolution, marked *pinned*, *auto skips*, *untested*, *unlocked* or *highest* where it applies. Picking one asks you to keep it, and reverts by itself otherwise |
@@ -186,13 +186,16 @@ The switches are real switches and the brightness control is a real slider:
 using one leaves the menu open, so the status header and the display list above
 update in place instead of making you reopen the menu to see what happened. The
 whole menu refreshes once a second for as long as it is open. Every other row
-closes the menu as usual.
+closes the menu as usual. The arrow keys move through the rows and
+<kbd>Return</kbd> picks one, which closes the menu, switches included.
 
 **Pausing** is switching off with an end in sight: the internal display comes
 back, and switching resumes on its own — at the deadline, or the next time a
-display is connected or disconnected, which is the one for handing your laptop
-to a projector. Flipping the master switch by hand cancels a pause. A pause is
-not remembered across a relaunch; the app always starts switching.
+display is connected, disconnected or swapped, which is the one for handing
+your laptop to a projector. Displays going to sleep and waking up do not count.
+Flipping the master switch by hand or **Reset Displays (Panic)** cancels a
+pause. A pause is not remembered across a relaunch; the app always starts
+switching.
 
 **Restore brightness** is the level the internal panel is set to when it comes
 back on. The app learns it from the panel whenever it is lit, so the slider is
@@ -204,7 +207,9 @@ Only these are remembered across launches: **Notifications**,
 **Restore brightness**, **Always use highest rate**, which refresh rates you
 kept, reverted or picked by hand, **Stay awake with lid closed**, **Match UI
 size on all displays**, **UI size**, and the sizes you picked by hand. They live in the app's own `UserDefaults`, so there is
-no config file to edit.
+no config file to edit. The same place also holds what the app keeps for
+itself: the rate each monitor settled at, and what it needs to clean up after
+a crash (a refresh rate trial in progress, sleep switched off).
 
 Global shortcuts:
 
@@ -234,13 +239,16 @@ advertising one that belongs to someone else.
 per monitor. It lists the modes macOS has for the display at its current
 resolution, changes the rate and never the resolution, and keeps a HiDPI mode
 HiDPI. Picking a rate writes it to the display preferences at once and asks
-**Keep** or **Revert**. Some monitors spend ten seconds or more hunting for
+**Revert** or **Keep**. **Revert** is the default button, so <kbd>Return</kbd>
+pressed in front of a black screen puts the old rate back; keeping a rate
+takes a click. Some monitors spend ten seconds or more hunting for
 their input after a rate change, so the countdown does not start until the
 display has shown the new mode unchanged for 3 seconds (or 20 seconds have
 passed, for a monitor that hunts without macOS noticing). It then runs for 45
 seconds, starts over if the display changes again, and gives up after two
 minutes at most. Running out reverts, so a rate that leaves the screen black
-undoes itself.
+undoes itself. If putting the old rate back fails, the app says so and tries
+again the next time that monitor shows up.
 
 Answers are remembered per monitor (vendor, product and serial) and
 resolution. **Revert** marks the rate *auto skips*: **Always use highest
@@ -266,7 +274,10 @@ replaces the CEA timing least worth keeping (one below 60 Hz first). Anything
 else in the override, such as a HiDPI scale list, is kept, and the original
 file is copied to `~/Library/Application Support/AutoDisplayToggle/OverrideBackups`
 before the first change. The folder belongs to root, so macOS asks for an
-administrator password unless the file is already yours. macOS reads the
+administrator password unless the file is already yours. The new file goes
+to root inside the privileged command itself, never through a file your account
+could swap while the password prompt is up; the `sudoers` rule for **Stay awake
+with lid closed** is installed the same way, after `visudo` checks it. macOS reads the
 override when the display connects, so the rate shows up as *reconnect display*
 until you replug it or restart. Until you have kept an unlocked rate once,
 **Always use highest rate** only switches to it through the Keep / Revert
@@ -287,7 +298,8 @@ handlers. Every five seconds, and after every relevant system event, the app:
 1. Re-resolves the built-in display's ID by scanning `CGGetOnlineDisplayList`
    for `CGDisplayIsBuiltin`.
 2. Computes the desired state — internal off if any non-built-in display is
-   active.
+   active, or mirroring the built-in one (a hardware mirror set reports only
+   its primary as active).
 3. Compares it against the actual state (`CGDisplayIsActive`) and acts only on a
    mismatch.
 4. If the internal display is meant to be off, enforces zero brightness
@@ -349,10 +361,16 @@ Other implementation notes:
   watchdog process switches sleep back on if the app dies; the next launch
   checks too. A refresh rate trial cut short by a crash or a forced power-off
   is reverted when that monitor shows up again.
-- The internal display is re-enabled on **every** exit path — the Quit menu
-  item, `applicationWillTerminate`, and `SIGTERM`/`SIGINT`/`SIGHUP` handlers —
-  so killing the process or logging out can't leave the panel dark and
-  unreachable.
+- The internal display is re-enabled on every exit path the app sees — the
+  Quit menu item, `applicationWillTerminate`, and `SIGTERM`/`SIGINT`/`SIGHUP`
+  handlers. A crash or `kill -9` skips all of those, and the panel is switched
+  off for the whole login session, so a second process covers them: the app
+  binary started with `--restore-builtin-after <pid>` waits for the app to end
+  and switches the panel back on with its saved backlight. After a clean exit
+  it finds nothing to do.
+- Unplugging the monitor while a switch-off is still waiting in its helper
+  cancels the helper and switches the panel straight back on, instead of
+  leaving every screen black for the ten seconds the helper waits.
 
 ### Logs
 
@@ -367,8 +385,8 @@ only. Nothing is sent anywhere.
   reveals it in Finder and shows how much space both files take. **Clear
   Logs…** deletes both after asking; the fresh file starts with a
   `logs cleared` line.
-- **Unified log:** the same lines, under subsystem `com.user.AutoDisplayToggle`,
-  for Console.app or:
+- **Unified log:** the same lines, with your home folder written as `~`, under
+  subsystem `com.user.AutoDisplayToggle`, for Console.app or:
   ```bash
   log show --last 1d --info --predicate 'subsystem == "com.user.AutoDisplayToggle"'
   ```
@@ -409,14 +427,20 @@ jq -r 'select(.msg == "built-in display switched") | .fields.ms' ~/Library/Logs/
 
 ### Private APIs
 
-This app depends on two undocumented Apple symbols:
+This app depends on undocumented Apple symbols:
 
 - `CGSConfigureDisplayEnabled` (CoreGraphics) — enables/disables a display
 - `DisplayServicesSetBrightness` / `DisplayServicesGetBrightness`
   (DisplayServices.framework, a private framework)
+- `CGSGetNumberOfDisplayModes`, `CGSGetDisplayModeDescriptionOfLength`,
+  `CGSGetCurrentDisplayMode` and `CGSConfigureDisplayMode` (CoreGraphics) — the
+  full mode list with its HiDPI sizes, for **Match UI size on all displays**
 
 There is no public API for disabling a display, so this is unavoidable. It also
-means **a future macOS release can break this app without warning.**
+means **a future macOS release can break this app without warning.** The
+symbols are looked up when the app runs rather than linked, so a missing one
+does not stop the app from starting: its calls fail and are logged, and a
+warning says so when switching itself is affected.
 
 ## Caveats
 
@@ -428,6 +452,16 @@ means **a future macOS release can break this app without warning.**
   to the remembered **Restore brightness** value (50% on a first run).
 - In clamshell mode the built-in display isn't enumerated at all, so the app
   correctly does nothing.
+- **Press <kbd>⌃</kbd><kbd>⌥</kbd><kbd>⌘</kbd><kbd>D</kbd> before unplugging
+  the last external display** with the lid open, and wait for the internal
+  panel to light up; <kbd>⌃</kbd><kbd>⌥</kbd><kbd>⌘</kbd><kbd>E</kbd> turns
+  switching back on afterwards. Unplugged while the panel is switched off,
+  macOS drops the panel and shows a virtual placeholder display instead: the
+  panel can no longer be switched on (`CGSConfigureDisplayEnabled` returns
+  1001), and the monitor stays dark when plugged back in. Only a restart
+  recovers from that. Seen on an Intel MacBook Pro 16" (2019) with macOS 26.7;
+  re-enabling either display, `CGRestorePermanentDisplayConfiguration` and
+  keeping the discrete GPU active all failed to bring it back.
 
 ## Releasing
 

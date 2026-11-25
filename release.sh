@@ -62,8 +62,14 @@ if [[ "$PUBLISH" == "1" ]]; then
         echo "HEAD is not pushed - push it first so GitHub can tag it." >&2
         exit 1
     fi
-    if gh release view "v${VERSION}" >/dev/null 2>&1; then
+    # Checked before the build: a broken login or proxy would otherwise read
+    # as "no such release" and fail only after building and notarizing.
+    gh auth status >/dev/null 2>&1 || { echo "gh is not signed in or cannot reach GitHub (gh auth status)." >&2; exit 1; }
+    if RELEASE_CHECK="$(gh release view "v${VERSION}" 2>&1)"; then
         echo "Release v${VERSION} already exists. Bump CFBundleShortVersionString in Info.plist." >&2
+        exit 1
+    elif [[ "$RELEASE_CHECK" != *"not found"* ]]; then
+        echo "Could not check for release v${VERSION}: ${RELEASE_CHECK}" >&2
         exit 1
     fi
 fi
@@ -71,9 +77,8 @@ fi
 rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
 
-# The SDK ships a .tbd stub for DisplayServices covering both architectures.
-# /System/Library/PrivateFrameworks only resolves through this Mac's own
-# dyld cache, so it cannot link the other architecture's slice.
+# The private display calls are looked up at run time (see PrivateAPI), so
+# nothing private is linked and the SDK builds both architectures.
 SDK="$(xcrun --show-sdk-path)"
 build_slice() {
     local arch="$1"
@@ -84,9 +89,7 @@ build_slice() {
         -o "${BUILD_DIR}/${APP_NAME}-${arch}" \
         -framework Cocoa \
         -framework UserNotifications \
-        -framework Carbon \
-        -F "${SDK}/System/Library/PrivateFrameworks" \
-        -framework DisplayServices
+        -framework Carbon
 }
 build_slice x86_64
 build_slice arm64

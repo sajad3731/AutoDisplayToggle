@@ -26,5 +26,7 @@
 	<true/>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>AutoDisplayToggle asks macOS for an administrator password to update a display override or the sleep rule.</string>
 </dict>
 </plist>
